@@ -1,5 +1,7 @@
 # myhostmcp — a split MCP for running commands on a remote host
 
+> **AI assistance disclosure:** This project/documentation was written with the assistance of AI tools, with human review and edits.
+
 `myhostmcp` lets an AI agent run commands on a remote host *in a persistent
 session*, over SSH, using your normal local SSH credentials. It is a single
 binary with two modes:
