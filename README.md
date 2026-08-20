@@ -65,9 +65,9 @@ examples/pi-extension/           pi extension (pi has no built-in MCP; this brid
 
 ## Why split it this way
 
-- **Uses your real SSH setup.** The local half shells out to `ssh`, so your
-  `~/.ssh/config`, default keys, agent, bastions and `known_hosts` all work with
-  zero extra configuration.
+- **Uses your real SSH / Teleport setup.** The local half shells out to `ssh`
+  (or `tsh` for Teleport), so your `~/.ssh/config`, default keys, agent,
+  bastions and `known_hosts` all work with zero extra configuration.
 - **No daemon to run.** The agent launches the local half on startup; it does
   nothing (no SSH) until a tool is actually called — lazy connect.
 - **No locking / no blocking.** Each connection starts its own
@@ -117,7 +117,7 @@ INSTALL.md for per-agent details and the pi extension).
 
 | Tool | Purpose |
 |------|---------|
-| `remote_connect` | Open (or reuse) a persistent SSH session to a host; uploads & starts the remote executor. Args: `host` (req unless `defaultHost` set), `user`, `port`, `identityFile`, `session`. |
+| `remote_connect` | Open (or reuse) a persistent session (via tsh or ssh). Runs `tsh login` automatically if not authenticated. Args: `host` (req unless `defaultHost` set), `user`, `port`, `identityFile`, `session`, `transport` (`"auto"`/`"ssh"`/`"tsh"`), `teleportProxy`, `teleportCluster`. |
 | `remote_exec` | Run a command in the persistent remote shell. `cd`/`export`/`alias`/`source` persist. Args: `command` (req), `session`, `cwd`, `timeout` (e.g. `"30s"`), `pty` (Phase 2). Rejected by the remote if not in its allowlist. |
 | `remote_allowed_commands` | Query the remote host for the command allowlist it enforces. Args: `session`. |
 | `remote_status` | List open sessions and which one is the default. (Per-host allowlists are reported by `remote_allowed_commands`.) |
@@ -165,6 +165,27 @@ A second agent instance (or a second session in the same chat) simply gets its
 own remote process — nobody is blocked. Exclusivity is automatic: each remote
 reads only its own SSH stdin, so no other client can inject into your instance.
 
+## Teleport (tsh) support
+
+With `transport: auto` (the default), myhostmcp tries `tsh` first when it is
+found in `$PATH`:
+
+1. **Login** — `tsh status` is checked first. If the certificate is missing or
+   expired, `tsh login` is run automatically before connecting. For browser-based
+   SSO a browser window opens on your desktop and the agent waits for it to
+   complete. Terminal-based auth (password / TOTP) requires a tty — run
+   `tsh login` manually first, or use SSO / device trust.
+2. **Session recording** — the persistent session is started with `-tt` (force
+   PTY) so Teleport can record it. The PTY is immediately put into raw mode
+   (`stty raw -echo`) so JSON protocol framing is unaffected.
+3. **Fallback** — if tsh is unavailable, login fails, or the host is not a
+   Teleport node, the connection falls back transparently to `ssh`. The
+   `fallbackNote` field in the connect result explains what happened.
+
+Force a specific transport with `remote_connect { transport: "tsh" }` (no
+fallback), `{ transport: "ssh" }` (skip tsh entirely), or set `transport` in
+`~/.myhostmcp/config.yaml` as the default for all sessions.
+
 ## Known limitations
 
 - PTY execution (`remote_exec` with `pty=true`) is not implemented yet.
@@ -172,3 +193,5 @@ reads only its own SSH stdin, so no other client can inject into your instance.
   redirection are rejected while an allowlist is active.
 - If GNU `timeout(1)` is absent on the remote host, timeouts still work via a
   Go backstop but may terminate the whole session when exceeded.
+- Teleport terminal-based auth (password/TOTP) requires `tsh login` to be run
+  manually before starting the agent; browser-based SSO works automatically.

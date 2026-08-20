@@ -1,12 +1,18 @@
 // Package local implements the local half of myhostmcp: a stdio MCP server
 // that an AI agent spawns. It exposes five tools (remote_connect, remote_exec,
-// remote_allowed_commands, remote_status, remote_disconnect) and manages one or more open SSH sessions
-// to remote hosts, forwarding commands to the remote half running there.
+// remote_allowed_commands, remote_status, remote_disconnect) and manages one
+// or more open sessions to remote hosts, forwarding commands to the remote
+// half running there.
 //
-// The local half does NO work on startup: it only registers tools. SSH
-// connections are opened lazily on the first remote_connect (or remote_exec
-// against a configured default host). Diagnostics go to a log file (or
-// stderr), never stdout — stdout is the MCP transport.
+// Connections use ssh by default. When tsh (Teleport) is available it is tried
+// first; if the user is not yet logged in, tsh login is run automatically
+// (browser-based SSO opens on the user's desktop). If tsh fails for any
+// reason the connection falls back to ssh transparently.
+//
+// The local half does NO work on startup: it only registers tools. Connections
+// are opened lazily on the first remote_connect (or remote_exec against a
+// configured default host). Diagnostics go to a log file (or stderr), never
+// stdout — stdout is the MCP transport.
 package local
 
 import (
@@ -68,7 +74,7 @@ func (m *Manager) buildServer() *mcp.Server {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "remote_connect",
-		Description: "Open (or reuse) a persistent SSH session to a remote host and start the remote myhostmcp executor there. The session stays open until remote_disconnect or the agent session ends. No SSH activity happens until this is called (or remote_exec with a default host).",
+		Description: "Open (or reuse) a persistent session to a remote host and start the remote myhostmcp executor there. Uses tsh (Teleport) when available, automatically running tsh login if needed (browser-based SSO will open a browser on your desktop); falls back to ssh if tsh is unavailable or fails. The session stays open until remote_disconnect or the agent session ends. No connection activity happens until this is called (or remote_exec with a default host).",
 	}, m.handleConnect)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -98,11 +104,14 @@ func (m *Manager) buildServer() *mcp.Server {
 
 // ConnectInput is the argument to remote_connect.
 type ConnectInput struct {
-	Host         string `json:"host,omitempty" jsonschema:"SSH host to connect to, as resolvable by your ~/.ssh/config. If omitted, uses defaultHost from the local config."`
-	User         string `json:"user,omitempty" jsonschema:"remote login user; if omitted, ssh's default for the host"`
-	Port         int    `json:"port,omitempty" jsonschema:"SSH port; defaults to 22 or config"`
-	IdentityFile string `json:"identityFile,omitempty" jsonschema:"optional path to a private key, overriding config and ssh defaults"`
-	Session      string `json:"session,omitempty" jsonschema:"optional friendly name for this session; auto-named from the host if omitted"`
+	Host            string `json:"host,omitempty" jsonschema:"SSH/Teleport host to connect to, as resolvable by your ~/.ssh/config or Teleport cluster. If omitted, uses defaultHost from the local config."`
+	User            string `json:"user,omitempty" jsonschema:"remote OS login user; if omitted, ssh's/tsh's default for the host"`
+	Port            int    `json:"port,omitempty" jsonschema:"SSH port; defaults to 22 or config"`
+	IdentityFile    string `json:"identityFile,omitempty" jsonschema:"optional path to a private key, overriding config and ssh defaults"`
+	Session         string `json:"session,omitempty" jsonschema:"optional friendly name for this session; auto-named from the host if omitted"`
+	Transport       string `json:"transport,omitempty" jsonschema:"transport override: \"auto\" (default; try tsh then ssh), \"ssh\" (always use ssh), or \"tsh\" (always use tsh, no fallback)"`
+	TeleportProxy   string `json:"teleportProxy,omitempty" jsonschema:"Teleport proxy address for tsh login, e.g. proxy.example.com:443; if omitted tsh uses its configured default"`
+	TeleportCluster string `json:"teleportCluster,omitempty" jsonschema:"optional Teleport cluster or leaf-cluster name passed to tsh login; if omitted the proxy default is used"`
 }
 
 // ConnectOutput is the structured result of remote_connect.
@@ -117,6 +126,9 @@ type ConnectOutput struct {
 	HasTimeout       bool       `json:"hasTimeout"`
 	AllowCommands    [][]string `json:"allowCommands,omitempty"` // the remote's enforced allowlist
 	AlreadyConnected bool       `json:"alreadyConnected,omitempty"`
+	Transport        string     `json:"transport,omitempty"`    // "ssh" or "tsh"
+	LoginNote        string     `json:"loginNote,omitempty"`   // non-empty when tsh login was performed
+	FallbackNote     string     `json:"fallbackNote,omitempty"` // non-empty when tsh failed and ssh was used
 }
 
 // ExecInput is the argument to remote_exec.
@@ -156,6 +168,7 @@ type SessionInfo struct {
 	RemotePID     int    `json:"remotePid"`
 	RemoteVersion string `json:"remoteVersion"`
 	HasTimeout    bool   `json:"hasTimeout"`
+	Transport     string `json:"transport,omitempty"` // "ssh" or "tsh"
 }
 
 // DisconnectInput is the argument to remote_disconnect.
@@ -222,9 +235,26 @@ func (m *Manager) handleConnect(ctx context.Context, _ *mcp.CallToolRequest, in 
 			RemoteVersion: existing.RemoteVersion, HasTimeout: existing.HasTimeout,
 			AlreadyConnected: true,
 			AllowCommands:    allow,
+			Transport:        existing.Transport,
 		}
-		return m.okResult(fmt.Sprintf("Reusing existing session %q to %s (remote pid %d). %d allowed command(s).",
-			name, existing.Host, existing.RemotePID, len(allow)), out), out, nil
+		return m.okResult(fmt.Sprintf("Reusing existing session %q to %s via %s (remote pid %d). %d allowed command(s).",
+			name, existing.Host, existing.Transport, existing.RemotePID, len(allow)), out), out, nil
+	}
+
+	// Transport preference: per-call input overrides config default.
+	tBinary := transport.TransportBinary(in.Transport)
+	if tBinary == "" {
+		tBinary = transport.TransportBinary(m.cfg.Transport)
+	}
+
+	// Teleport login params: per-call input overrides config default.
+	tProxy := in.TeleportProxy
+	if tProxy == "" {
+		tProxy = m.cfg.TeleportProxy
+	}
+	tCluster := in.TeleportCluster
+	if tCluster == "" {
+		tCluster = m.cfg.TeleportCluster
 	}
 
 	opts := transport.DialOptions{
@@ -235,13 +265,22 @@ func (m *Manager) handleConnect(ctx context.Context, _ *mcp.CallToolRequest, in 
 		RemoteInstallDir:      m.cfg.RemoteInstallDir,
 		ConnectTimeout:        time.Duration(m.cfg.ConnectTimeout),
 		StrictHostKeyChecking: m.cfg.StrictHostKeyChecking,
+		TransportBinary:       tBinary,
+		TeleportProxy:         tProxy,
+		TeleportCluster:       tCluster,
 	}
-	m.log.Printf("connecting session=%q host=%s user=%s port=%d", name, host, user, port)
+	m.log.Printf("connecting session=%q host=%s user=%s port=%d transport=%s", name, host, user, port, tBinary)
 
 	s, err := transport.Dial(ctx, opts)
 	if err != nil {
 		m.log.Printf("connect failed: %v", err)
 		return m.errResult(fmt.Sprintf("failed to connect to %s: %v", host, err), ConnectOutput{}), ConnectOutput{}, nil
+	}
+	if s.LoginNote != "" {
+		m.log.Printf("session %q: %s", name, s.LoginNote)
+	}
+	if s.FallbackNote != "" {
+		m.log.Printf("session %q: %s", name, s.FallbackNote)
 	}
 
 	// Drain remote stderr into our log.
@@ -272,15 +311,31 @@ func (m *Manager) handleConnect(ctx context.Context, _ *mcp.CallToolRequest, in 
 	}
 
 	out := ConnectOutput{
-		Session: name, Host: s.Host, User: s.User, Port: s.Port,
-		Platform: s.Platform, RemotePID: s.RemotePID,
-		RemoteVersion: s.RemoteVersion, HasTimeout: s.HasTimeout,
+		Session:       name,
+		Host:          s.Host,
+		User:          s.User,
+		Port:          s.Port,
+		Platform:      s.Platform,
+		RemotePID:     s.RemotePID,
+		RemoteVersion: s.RemoteVersion,
+		HasTimeout:    s.HasTimeout,
 		AllowCommands: allow,
+		Transport:     s.Transport,
+		LoginNote:     s.LoginNote,
+		FallbackNote:  s.FallbackNote,
 	}
-	m.log.Printf("connected session=%q host=%s platform=%s pid=%d allow=%d", name, s.Host, s.Platform, s.RemotePID, len(allow))
-	return m.okResult(fmt.Sprintf(
-		"Connected session %q to %s (%s). Remote myhostmcp v%s, pid %d. timeout(1) available: %v. %d allowed command(s) (use remote_allowed_commands to list them).",
-		name, s.Host, s.Platform, s.RemoteVersion, s.RemotePID, s.HasTimeout, len(allow)), out), out, nil
+	m.log.Printf("connected session=%q host=%s platform=%s pid=%d transport=%s allow=%d",
+		name, s.Host, s.Platform, s.RemotePID, s.Transport, len(allow))
+	summaryMsg := fmt.Sprintf(
+		"Connected session %q to %s (%s) via %s. Remote myhostmcp v%s, pid %d. timeout(1) available: %v. %d allowed command(s) (use remote_allowed_commands to list them).",
+		name, s.Host, s.Platform, s.Transport, s.RemoteVersion, s.RemotePID, s.HasTimeout, len(allow))
+	if s.LoginNote != "" {
+		summaryMsg += "\nNote: " + s.LoginNote
+	}
+	if s.FallbackNote != "" {
+		summaryMsg += "\nNote: " + s.FallbackNote
+	}
+	return m.okResult(summaryMsg, out), out, nil
 }
 
 func (m *Manager) handleExec(ctx context.Context, _ *mcp.CallToolRequest, in ExecInput) (*mcp.CallToolResult, ExecOutput, error) {
@@ -384,12 +439,13 @@ func (m *Manager) handleStatus(_ context.Context, _ *mcp.CallToolRequest, _ stru
 			Name: name, Host: s.Host, User: s.User, Port: s.Port,
 			Platform: s.Platform, RemotePID: s.RemotePID,
 			RemoteVersion: s.RemoteVersion, HasTimeout: s.HasTimeout,
+			Transport: s.Transport,
 		})
 	}
 	text := fmt.Sprintf("myhostmcp v%s. %d session(s). default=%q",
 		out.Version, len(out.Sessions), out.Default)
 	for _, si := range out.Sessions {
-		text += fmt.Sprintf("\n  - %s: %s (pid %d, %s)", si.Name, si.Host, si.RemotePID, si.Platform)
+		text += fmt.Sprintf("\n  - %s: %s via %s (pid %d, %s)", si.Name, si.Host, si.Transport, si.RemotePID, si.Platform)
 	}
 	return m.okResult(text, out), out, nil
 }

@@ -24,6 +24,8 @@ and wiring it into **Claude Code**, **OpenCode**, and **pi** (from pi.dev).
 - **GNU `timeout(1)`** on the remote host for per-command timeouts (present on
   essentially all Linux servers; part of coreutils). If absent, a Go deadline
   backstop still bounds commands (by killing the session on timeout).
+- **Teleport / tsh** (optional) — if `tsh` is on your `$PATH`, `myhostmcp`
+  uses it automatically (see [Teleport section](#teleport-tsh)).
 
 ## 2. Build
 
@@ -74,6 +76,13 @@ Notable fields:
 | `strictHostKeyChecking` | passed to SSH `StrictHostKeyChecking` (default `accept-new`; set `yes` for stricter host-key policy) |
 | `connectTimeout`, `execTimeout` | durations like `15s`, `60s` |
 | `logFile` | local-half diagnostics; must NOT be stdout (stdout is MCP). Default: stderr. |
+| `transport` | `"auto"` (default), `"ssh"`, or `"tsh"` |
+| `teleportProxy` | Teleport proxy address for `tsh login`, e.g. `proxy.example.com:443` |
+| `teleportCluster` | optional Teleport cluster / leaf-cluster name for `tsh login` |
+
+> **Teleport:** `teleportProxy` and `teleportCluster` are used by the automatic
+> `tsh login` step if the certificate is missing or expired.  They can also be
+> overridden per-call in `remote_connect { teleportProxy: "...", teleportCluster: "..." }`.
 
 > The command **allowlist is not a local setting**. It lives on the remote
 > host at `/etc/myhostmcp/config.yaml` so the remote always has the final say
@@ -339,6 +348,43 @@ go run ./examples/stdio_client -binary ./build/myhostmcp -host myserver
 - If GNU `timeout(1)` is missing on the remote, timeouts still work via a Go
   backstop, but timeout handling may terminate the session.
 
+## Teleport (tsh)
+
+`myhostmcp` automatically uses `tsh` when it is found in `$PATH`
+(`transport: auto`).  The full workflow on each `remote_connect`:
+
+1. **Check login status** — `tsh status` is run silently.  If the certificate
+   is valid, the connection proceeds immediately (no overhead).
+2. **Automatic login** — if the cert is missing or expired, `tsh login` is
+   called using the configured proxy and cluster:
+   ```yaml
+   # ~/.myhostmcp/config.yaml
+   transport: auto           # or "tsh" to disable ssh fallback
+   teleportProxy: proxy.example.com:443
+   teleportCluster: prod     # optional leaf cluster
+   ```
+   - **Browser-based SSO** (Okta, GitHub, Google, etc.) — a browser window
+     opens on your desktop automatically.  The agent waits for the flow to
+     complete before proceeding.
+   - **Terminal-based auth** (local password, TOTP/OTP) — `tsh login` needs
+     to write prompts to a terminal, which is not available while the MCP
+     server is running (its stdin/stdout carry the MCP protocol).  Run
+     `tsh login` manually in your terminal first, or switch to browser SSO or
+     device trust / machine certificates.
+3. **PTY + session recording** — the persistent session is started with `-tt`
+   (force PTY allocation even without a local terminal) so Teleport can record
+   it.  The PTY is immediately put into raw mode (`stty raw -echo`) so that
+   output CRLF translation and input echo are both disabled — the JSON
+   protocol framing is unaffected.
+4. **Fallback to ssh** — if tsh is not in PATH, the login fails, or the host
+   is not a Teleport node, the connection falls back transparently to plain
+   `ssh`.  The `fallbackNote` field in the `remote_connect` result explains
+   why.  Use `transport: tsh` to disable the fallback (return an error
+   instead).
+
+To confirm Teleport is being used, check the `transport` field in the
+`remote_connect` result or call `remote_status`.
+
 ## 7. Troubleshooting
 
 **"failed to connect to HOST: ..." / SSH auth errors.** Make sure plain `ssh
@@ -346,6 +392,17 @@ HOST` works from the same shell you launch the agent from. `myhostmcp` passes
 `-o BatchMode=yes`, so it will never prompt — if your key needs a passphrase,
 load it into `ssh-agent` (`ssh-add`). To use a specific key, pass
 `identityFile` to `remote_connect` or set `identityFiles` in config.
+
+**Teleport: `tsh login` fails / browser does not open.** Make sure `tsh` is
+configured and the proxy is reachable.  For browser SSO, the agent process
+must inherit your display environment (`$DISPLAY` on Linux, Quartz on macOS).
+If the browser does not open automatically, run `tsh login --proxy=<proxy>` in
+a terminal first.  For clusters that enforce terminal MFA, always
+pre-authenticate manually before starting the agent.
+
+**Teleport: sessions not appearing in the audit log.** The `-tt` PTY flag is
+always set by myhostmcp; check that the Teleport node's session recording mode
+is `node` or `proxy` in the cluster config.
 
 **"unsupported remote platform ... no prebuilt binary".** The embedded set
 doesn't include your remote's OS/arch. Run `./build.sh` (not `current`) to embed

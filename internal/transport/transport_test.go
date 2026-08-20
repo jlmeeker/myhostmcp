@@ -139,7 +139,7 @@ func TestEnsureInstalledSkipsWhenVersionMatches(t *testing.T) {
 	})
 
 	uploaded := false
-	runOnceFn = func(_ context.Context, _ DialOptions, remoteCmd string, stdin io.Reader) ([]byte, error) {
+	runOnceFn = func(_ context.Context, _ DialOptions, _, remoteCmd string, stdin io.Reader) ([]byte, error) {
 		if strings.Contains(remoteCmd, "remote --version") {
 			return []byte("myhostmcp " + version.Version + "\n"), nil
 		}
@@ -153,7 +153,7 @@ func TestEnsureInstalledSkipsWhenVersionMatches(t *testing.T) {
 		return nil, nil
 	}
 
-	err := ensureInstalled(context.Background(), DialOptions{Host: "dummy"}, "~/.myhostmcp/myhostmcp", "Linux", "x86_64")
+	err := ensureInstalled(context.Background(), DialOptions{Host: "dummy"}, "~/.myhostmcp/myhostmcp", "Linux", "x86_64", "ssh")
 	if err != nil {
 		t.Fatalf("ensureInstalled: %v", err)
 	}
@@ -195,4 +195,33 @@ func safeAllowedCommand(allow [][]string) string {
 		}
 	}
 	return ""
+}
+
+func TestParseResponseLine(t *testing.T) {
+	ready := `{"type":"log","msg":"ready","version":"0.2.0-dev","pid":123,"hasTimeout":true}`
+
+	cases := []struct {
+		name    string
+		line    string
+		wantOK  bool
+		wantMsg string
+	}{
+		{"clean", ready, true, "ready"},
+		{"leading banner", "All actions are being monitored" + ready, true, "ready"},
+		{"leading banner with brace", "note {monitored} here " + ready, true, "ready"},
+		{"trailing noise", ready + "  # prompt$", true, "ready"},
+		{"pure banner", "-------------------------------- All actions are being monitored", false, ""},
+		{"empty", "", false, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resp, ok := parseResponseLine(c.line)
+			if ok != c.wantOK {
+				t.Fatalf("ok = %v, want %v (line=%q)", ok, c.wantOK, c.line)
+			}
+			if ok && resp.Msg != c.wantMsg {
+				t.Fatalf("msg = %q, want %q", resp.Msg, c.wantMsg)
+			}
+		})
+	}
 }

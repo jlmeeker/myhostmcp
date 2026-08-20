@@ -1,0 +1,157 @@
+# ~/.myhostmcp/config.yaml — local-half configuration
+#
+# This file is read by `myhostmcp local` (the MCP server your agent spawns).
+# All fields are optional; built-in defaults are shown in comments.
+#
+# Install:
+#   mkdir -p ~/.myhostmcp
+#   cp config.example.yaml ~/.myhostmcp/config.yaml
+#   $EDITOR ~/.myhostmcp/config.yaml
+#
+# The command allowlist is NOT configured here — it lives on each remote host
+# at /etc/myhostmcp/config.yaml (see config.remote.example.yaml). The remote
+# always has the final say over what the agent may run; this file cannot set
+# or relax it. Use remote_allowed_commands to query what a remote allows.
+
+# ----------------------------------------------------------------------------
+# Connection defaults
+#
+# All of these can be overridden per-call in remote_connect. They only provide
+# defaults so you don't have to repeat them on every call.
+# ----------------------------------------------------------------------------
+
+# defaultHost: if set, remote_connect and remote_exec use this host when no
+# host argument is provided. Useful if you primarily work on one machine.
+#
+# defaultHost: myserver.example.com
+
+# defaultUser: the remote OS login user. If unset, ssh/tsh uses its own
+# default (usually your local username, or what ~/.ssh/config specifies).
+#
+# defaultUser: deploy
+
+# defaultPort: SSH port on the remote host. Default: 22
+#
+# defaultPort: 22
+
+# identityFiles: list of private-key paths passed as -i to ssh/tsh. If empty,
+# ssh uses its normal key-discovery order (~/.ssh/id_ed25519, ssh-agent, etc.).
+# Paths may use ~.
+#
+# identityFiles:
+#   - ~/.ssh/id_ed25519
+#   - ~/.ssh/id_rsa
+
+# ----------------------------------------------------------------------------
+# Remote binary placement
+# ----------------------------------------------------------------------------
+
+# remoteInstallDir: where myhostmcp places its remote binary on each host.
+# The ~ is expanded by the remote shell, not locally. Default: ~/.myhostmcp
+#
+# remoteInstallDir: ~/.myhostmcp
+
+# ----------------------------------------------------------------------------
+# Security
+# ----------------------------------------------------------------------------
+
+# strictHostKeyChecking: passed to ssh as -o StrictHostKeyChecking=...
+# (not used by tsh, which verifies hosts via Teleport certificate authorities).
+#
+#   accept-new  — trust new hosts on first connection, reject changed keys.
+#                 Good default for most environments. (built-in default)
+#   yes         — never add new hosts; fail if the key is unknown. Use this
+#                 in security-sensitive environments where hosts are pre-approved
+#                 in known_hosts.
+#   no          — never check host keys. Not recommended.
+#
+# strictHostKeyChecking: accept-new
+
+# ----------------------------------------------------------------------------
+# Timeouts
+# ----------------------------------------------------------------------------
+
+# connectTimeout: how long to wait when establishing a new session. This
+# applies to the platform-detection, binary-upload, and remote-start steps,
+# but NOT to the tsh login step (which may require a browser SSO flow).
+# Default: 15s
+#
+# connectTimeout: 15s
+
+# execTimeout: default per-command timeout for remote_exec. The agent can
+# override this per-call with the timeout argument (e.g. "30s", "2m").
+# Default: 60s
+#
+# execTimeout: 60s
+
+# ----------------------------------------------------------------------------
+# Logging
+# ----------------------------------------------------------------------------
+
+# logFile: where the local half writes its diagnostic log. Must not be stdout
+# (stdout carries the MCP protocol). If unset, diagnostics go to stderr, which
+# the agent process typically captures or discards.
+# Paths may use ~.
+#
+# logFile: ~/.myhostmcp/local.log
+
+# ----------------------------------------------------------------------------
+# Transport: ssh vs. tsh (Teleport)
+# ----------------------------------------------------------------------------
+
+# transport: which binary to use for connections.
+#
+#   auto  — (default) try tsh first if it is found in $PATH. If tsh is
+#            unavailable or fails for any reason (not logged in, host is not
+#            a Teleport node, cluster unreachable, etc.), fall back to ssh
+#            transparently. The fallbackNote field in remote_connect explains
+#            what happened.
+#   ssh   — always use ssh; never try tsh.
+#   tsh   — always use tsh; return an error instead of falling back to ssh.
+#            Use this when every target host is a Teleport node and you want
+#            a hard failure rather than a silent fallback.
+#
+# transport: auto
+
+# teleportProxy: the Teleport proxy address passed to `tsh login --proxy=...`
+# when the user is not yet authenticated (certificate missing or expired).
+# If unset, tsh uses its own configured default proxy (~/.tsh/config or the
+# last proxy used with `tsh login`).
+#
+# teleportProxy: proxy.example.com:443
+
+# teleportCluster: optional Teleport cluster or leaf-cluster name passed as a
+# positional argument to `tsh login`. If unset, the default cluster for the
+# proxy is used. Set this when connecting to leaf clusters behind a root proxy.
+#
+# teleportCluster: prod-us-east
+
+# ----------------------------------------------------------------------------
+# Example: plain SSH environment (no Teleport)
+# ----------------------------------------------------------------------------
+# defaultHost: bastion.example.com
+# defaultUser: ubuntu
+# identityFiles:
+#   - ~/.ssh/id_ed25519
+# connectTimeout: 20s
+# execTimeout: 120s
+# logFile: ~/.myhostmcp/local.log
+
+# ----------------------------------------------------------------------------
+# Example: Teleport environment
+# ----------------------------------------------------------------------------
+# transport: auto              # try tsh first, fall back to ssh
+# teleportProxy: teleport.example.com:443
+# teleportCluster: prod        # omit if using the root cluster directly
+# defaultUser: ec2-user        # remote OS user (separate from Teleport identity)
+# connectTimeout: 30s          # give tsh login browser flow time to load
+# logFile: ~/.myhostmcp/local.log
+
+# ----------------------------------------------------------------------------
+# Example: mixed environment (some Teleport nodes, some plain SSH)
+# ----------------------------------------------------------------------------
+# transport: auto              # tsh for Teleport nodes, ssh fallback for others
+# teleportProxy: teleport.example.com:443
+# identityFiles:
+#   - ~/.ssh/id_ed25519        # used for non-Teleport hosts
+# logFile: ~/.myhostmcp/local.log

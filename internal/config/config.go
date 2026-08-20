@@ -47,6 +47,20 @@ type Config struct {
 	ConnectTimeout        Duration `yaml:"connectTimeout"`
 	ExecTimeout           Duration `yaml:"execTimeout"`
 	LogFile               string   `yaml:"logFile"`
+
+	// Transport selects which binary to use for SSH connections.
+	// Valid values: "" or "auto" (default; try tsh then ssh), "ssh", "tsh".
+	Transport string `yaml:"transport"`
+
+	// TeleportProxy is the Teleport proxy address used for `tsh login
+	// --proxy=...` when the user is not yet authenticated.  If empty, tsh
+	// uses its own configured default proxy.
+	TeleportProxy string `yaml:"teleportProxy"`
+
+	// TeleportCluster is an optional Teleport cluster (leaf cluster) name
+	// passed as a positional argument to `tsh login`.  If empty, the default
+	// cluster for the proxy is used.
+	TeleportCluster string `yaml:"teleportCluster"`
 }
 
 // Default returns the built-in defaults.
