@@ -268,6 +268,11 @@ func (m *Manager) handleConnect(ctx context.Context, _ *mcp.CallToolRequest, in 
 		TransportBinary:       tBinary,
 		TeleportProxy:         tProxy,
 		TeleportCluster:       tCluster,
+		// Stream tsh login output (including the browser URL) to the log in
+		// real time so headless users can see the URL without waiting for
+		// login to complete.  The same output is included in LoginNote on
+		// success so the agent also reports it.
+		LoginProgressWriter: &tshLoginWriter{log: m.log},
 	}
 	m.log.Printf("connecting session=%q host=%s user=%s port=%d transport=%s", name, host, user, port, tBinary)
 
@@ -608,6 +613,61 @@ func remove(s []string, v string) []string {
 		}
 	}
 	return out
+}
+
+// tshLoginWriter is an io.Writer that line-buffers tsh login output and
+// forwards each non-empty line to the manager's logger.  It is used as
+// DialOptions.LoginProgressWriter so the browser URL (and any other status
+// lines) appear in the log immediately while tsh login blocks waiting for
+// the browser callback.
+type tshLoginWriter struct {
+	log *log.Logger
+	buf strings.Builder
+}
+
+func (w *tshLoginWriter) Write(p []byte) (int, error) {
+	// Normalize line boundaries BEFORE buffering.  tsh uses a bare \r (no
+	// following \n) to overwrite its "waiting for the browser" progress text
+	// on an interactive terminal.  If any \r reaches the logger it repositions
+	// the terminal cursor to column 0 without clearing the line, so a live TUI
+	// (e.g. pi) ends up with our line drawn over the previous one and the tail
+	// of the old line left as ghost text.  Treat every \r as a line boundary
+	// (collapsing \r\n) so the buffer only ever holds control-char-free text
+	// and every emitted line is complete and clean.
+	norm := strings.ReplaceAll(string(p), "\r\n", "\n")
+	norm = strings.ReplaceAll(norm, "\r", "\n")
+	w.buf.WriteString(norm)
+
+	// Flush all complete lines from the buffer.
+	for {
+		s := w.buf.String()
+		i := strings.IndexByte(s, '\n')
+		if i < 0 {
+			break
+		}
+		line := stripControl(s[:i])
+		w.buf.Reset()
+		w.buf.WriteString(s[i+1:])
+		if strings.TrimSpace(line) != "" {
+			w.log.Printf("tsh login: %s", line)
+		}
+	}
+	return len(p), nil
+}
+
+// stripControl removes C0 control characters (except tab) from a single line
+// of text, so no stray control byte can corrupt a terminal or TUI that renders
+// our log/tool output.
+func stripControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\t' {
+			return r
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // bufioLines wraps an io.ReadCloser in a bufio.Reader.

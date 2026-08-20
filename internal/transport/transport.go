@@ -19,44 +19,51 @@
 // [Session.Transport]; a non-empty [Session.FallbackNote] explains why a
 // fallback occurred.
 //
-// # PTY allocation and session recording
+// # One session per connect
 //
-// When using tsh (Teleport), the persistent session must be an interactive
-// shell session so that Teleport classifies and records it correctly.
+// A single Dial opens exactly ONE ssh/tsh connection and does all of its work
+// — platform detection, version check, binary upload, and the long-lived RPC
+// channel — inside that one remote shell.  This matters for two reasons:
 //
-// Teleport distinguishes two SSH session types:
-//   - exec:  `tsh ssh -tt host "command"` — Teleport sees the literal command
-//     string, marks the session as non-interactive, and may not record it.
-//   - shell: `tsh ssh -tt host` (no command) — Teleport sees an interactive
-//     shell session and records it as such.
+//   - Teleport: `tsh ssh host "command"` is classified as a non-interactive
+//     *exec* session (no PTY, usually not recorded), whereas `tsh ssh host`
+//     with NO command is an interactive *shell* session that Teleport records
+//     and that appears in `tsh sessions ls`.  Running each bootstrap step as a
+//     separate `tsh ssh host <cmd>` would therefore litter the audit log with
+//     non-interactive sessions alongside the one real interactive session.
+//   - ssh: each `ssh host <cmd>` is a separate authentication + session in the
+//     host's auth/sshd logs.  One shell per connect keeps those logs clean and
+//     avoids repeating the connection handshake.
 //
-// startRemote achieves a shell session by passing NO command argument to
-// `tsh ssh` and instead writing the startup sequence to stdin immediately
-// after the process starts.  The remote shell reads and executes it:
+// So both transports pass NO command argument.  startShell opens the shell and
+// bringUp drives the bootstrap over its stdin/stdout using sentinel markers
+// (see Session.sh/sync/upload), then hands the same shell off to the persistent
+// process with `exec ... remote`.
 //
-//	"stty raw -echo 2>/dev/null; ~/.myhostmcp/myhostmcp remote 2>>~/.myhostmcp/remote.log\n"
+// # PTY handling
 //
-// stty raw -echo: disables PTY output CRLF translation (ONLCR) and input
-// echo so the PTY does not corrupt the JSON framing.
-// 2>>remote.log on the binary: keeps its stderr out of the PTY master output
-// that we parse as JSON (a PTY merges remote stdout and stderr), while still
-// preserving startup diagnostics on the host — if the remote exits before it
-// announces "ready", this log holds the reason. recv() additionally skips any
-// line that does not start with '{' as a safety net for shell prompts, MOTD,
-// or command echo that arrive before stty settles.
+// tsh: a PTY is requested (-tt) so Teleport sees an interactive shell.  The
+// PTY is put into raw mode (`stty raw -echo`) so its CRLF translation (ONLCR)
+// and input echo do not corrupt the newline-delimited JSON framing.  Because a
+// PTY merges stdout and stderr, the remote binary's stderr is redirected to a
+// log file (`2>>~/.myhostmcp/remote.log`) so it stays out of the JSON stream
+// while remaining diagnosable on the host.  During bootstrap, sentinel markers
+// are built at runtime with printf (so an echoed command line can never
+// contain the assembled marker), making marker matching robust even before
+// stty raw settles.
 //
-// When using plain ssh, no PTY is requested.  stdout and stderr remain on
-// separate OS pipes, so the remote binary's log output flows to s.Stderr()
-// and is forwarded to the local log by the caller.
-//
-// One-shot helper commands (platform detection, binary upload) never request
-// a PTY regardless of transport.
+// ssh: NO PTY is requested.  stdout and stderr stay on separate OS pipes, so
+// the remote binary's log output flows to s.Stderr() and is forwarded to the
+// local log by the caller, and no CRLF/echo mangling can occur.
 package transport
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -113,6 +120,13 @@ type DialOptions struct {
 	// passed as a positional argument to `tsh login`.  If empty, the default
 	// cluster for the proxy is used.
 	TeleportCluster string
+
+	// LoginProgressWriter, if non-nil, receives tsh login output (including
+	// the browser URL line) in real time as tsh login runs.  In headless
+	// environments where the browser cannot open automatically, tsh prints a
+	// URL for the user to open manually; this writer surfaces that URL
+	// immediately rather than waiting until after login completes.
+	LoginProgressWriter io.Writer
 }
 
 // Session is an established connection to a remote myhostmcp remote half.
@@ -225,28 +239,34 @@ func dialWith(ctx context.Context, opts DialOptions, binary string) (*Session, e
 		}
 	}
 
-	// 1. Detect the remote platform.
-	sysname, machine, err := detectPlatform(ctx, opts, binary)
-	if err != nil {
-		return nil, fmt.Errorf("detect platform: %w", err)
-	}
-
-	// 2. Ensure the remote binary is present and version-current.
+	// 1. Open the single shell session (no command argument — see package doc).
 	remotePath := opts.RemoteInstallDir + "/myhostmcp"
-	if err := ensureInstalled(ctx, opts, remotePath, sysname, machine, binary); err != nil {
-		return nil, fmt.Errorf("install remote: %w", err)
-	}
-
-	// 3. Start the remote half as a persistent session.
-	s, err := startRemote(ctx, opts, remotePath, binary)
+	s, err := startShell(opts, binary)
 	if err != nil {
-		return nil, fmt.Errorf("start remote: %w", err)
+		return nil, fmt.Errorf("start %s: %w", binary, err)
 	}
-	s.Platform = sysname + " " + machine
 	s.Transport = binary
 	s.LoginNote = loginNote
 
-	// 4. Wait for the "ready" announcement on the protocol channel, bounded by
+	// 2. Over that one shell, detect the platform, install/upgrade the remote
+	//    binary if needed, and hand the shell off to the persistent process.
+	//    Bounded by ctx: bringUp's reads block on the pipe, so on timeout we
+	//    kill the session (closing the pipe) to unblock the goroutine.
+	errc := make(chan error, 1)
+	go func() { errc <- s.bringUp(opts, remotePath, binary) }()
+	select {
+	case err := <-errc:
+		if err != nil {
+			s.kill()
+			return nil, fmt.Errorf("bootstrap remote: %w", err)
+		}
+	case <-ctx.Done():
+		s.kill()
+		return nil, fmt.Errorf("bootstrap remote: timed out (%w); check %s/remote.log on the host",
+			ctx.Err(), opts.RemoteInstallDir)
+	}
+
+	// 3. Wait for the "ready" announcement on the protocol channel, bounded by
 	// the connect timeout. recv() is a blocking pipe read with no deadline, so a
 	// remote that dies silently before announcing (e.g. a config parse error, a
 	// missing/incompatible binary, or a login shell that never runs our startup
@@ -291,7 +311,13 @@ func dialWith(ctx context.Context, opts DialOptions, binary string) (*Session, e
 // was missing or expired); it is stored in [Session.LoginNote].
 func ensureTshLogin(ctx context.Context, opts DialOptions) (note string, err error) {
 	// Check current login status.  tsh status exits 0 when a valid cert exists.
-	check := exec.CommandContext(ctx, "tsh", "status")
+	// Pass --proxy when one is configured so we check status for the specific
+	// proxy we intend to connect through, not just any cached Teleport cert.
+	statusArgs := []string{"status"}
+	if opts.TeleportProxy != "" {
+		statusArgs = append(statusArgs, "--proxy="+opts.TeleportProxy)
+	}
+	check := exec.CommandContext(ctx, "tsh", statusArgs...)
 	check.Stdout = io.Discard
 	check.Stderr = io.Discard
 	if check.Run() == nil {
@@ -307,22 +333,41 @@ func ensureTshLogin(ctx context.Context, opts DialOptions) (note string, err err
 		args = append(args, opts.TeleportCluster)
 	}
 
-	// Capture stdout+stderr for error reporting.  We do NOT wire up stdin:
-	// browser-based SSO works without stdin (browser opens via the inherited
-	// display environment); terminal-based auth would fail here by design.
+	// Capture stdout+stderr for error reporting and for the success note.
+	// If the caller supplied a LoginProgressWriter, tee output there in real
+	// time so the browser URL is visible immediately — critical for headless
+	// environments where the browser cannot open and the user must visit the
+	// URL manually.  We do NOT wire up stdin: browser-based SSO works without
+	// stdin; terminal-based auth would fail here by design.
+	var capture bytes.Buffer
+	var loginOut io.Writer = &capture
+	if opts.LoginProgressWriter != nil {
+		loginOut = io.MultiWriter(&capture, opts.LoginProgressWriter)
+	}
 	login := exec.CommandContext(ctx, "tsh", args...)
-	var combined bytes.Buffer
-	login.Stdout = &combined
-	login.Stderr = &combined
+	login.Stdout = loginOut
+	login.Stderr = loginOut
 	if lerr := login.Run(); lerr != nil {
-		out := strings.TrimSpace(combined.String())
+		out := strings.TrimSpace(capture.String())
 		if out != "" {
 			return "", fmt.Errorf("tsh login: %w\n%s", lerr, out)
 		}
 		return "", fmt.Errorf("tsh login: %w", lerr)
 	}
 
-	return "performed tsh login (certificate was missing or expired)", nil
+	// Include tsh's output in the note so the agent can report the URL and
+	// any status messages back to the user even after login completes.
+	// Strip carriage returns before embedding: tsh uses bare \r to overwrite
+	// progress lines on an interactive terminal.  Left in the note they cause
+	// cursor repositioning when any terminal or TUI renders the tool result,
+	// letting adjacent UI chrome bleed onto the same line.
+	note = "performed tsh login (certificate was missing or expired)"
+	if msg := strings.TrimSpace(capture.String()); msg != "" {
+		msg = strings.ReplaceAll(msg, "\r\n", "\n") // Windows-style → Unix
+		msg = strings.ReplaceAll(msg, "\r", "")     // bare \r → gone
+		note += "\n" + strings.TrimSpace(msg) + "\n"
+	}
+	return note, nil
 }
 
 // Send writes a protocol.Request as one newline-delimited JSON line.
@@ -440,7 +485,22 @@ func (s *Session) recvReady(timeout time.Duration, logHint string) (*protocol.Re
 // blocking.
 func (s *Session) Stderr() io.ReadCloser { return s.stderr }
 
-// Close sends a shutdown request, closes stdin, and waits for the process to exit.
+// closeGrace is how long Close waits for the remote half to exit on its own
+// after a "shutdown" request before it force-kills the transport.
+const closeGrace = 5 * time.Second
+
+// Close shuts the session down cleanly: it asks the remote half to exit and
+// waits for the ssh/tsh client to disconnect normally, so the host-side
+// session ends immediately (and, for Teleport, the session recording is
+// finalized) instead of lingering as "active".
+//
+// The order matters. We do NOT kill the local client first: a SIGKILL to
+// ssh/tsh drops the connection abruptly, which leaves the remote process to be
+// reaped by a terminal hangup and the host/Teleport session to linger until a
+// keepalive timeout. Instead we send "shutdown", let the remote `myhostmcp
+// remote` process return and exit (0), which completes the remote shell/command
+// and makes ssh/tsh disconnect cleanly on its own. Only if the remote fails to
+// exit within closeGrace do we escalate to closing stdin and killing.
 func (s *Session) Close() error {
 	select {
 	case <-s.closed:
@@ -448,17 +508,38 @@ func (s *Session) Close() error {
 	default:
 	}
 	close(s.closed)
-	// Best-effort shutdown.
+
+	// Ask the remote half to exit. Ignore errors: if the write fails the
+	// connection is already gone and the wait below will return promptly.
 	_ = s.Send(&protocol.Request{Type: "shutdown"})
-	_ = s.stdin.Close()
+
+	exited := make(chan struct{})
+	go func() {
+		if s.cmd != nil {
+			_ = s.cmd.Wait() // also closes the stdin pipe once the client exits
+		}
+		close(exited)
+	}()
+
+	select {
+	case <-exited:
+		// Clean shutdown: the client disconnected normally.
+	case <-time.After(closeGrace):
+		// The remote did not exit in time. Force it: EOF on stdin may nudge the
+		// client out, then cancel the lifecycle context (SIGKILL via
+		// CommandContext) and kill the process outright.
+		_ = s.stdin.Close()
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.cmd != nil && s.cmd.Process != nil {
+			_ = s.cmd.Process.Kill()
+		}
+		<-exited
+	}
+
 	if s.cancel != nil {
-		s.cancel()
-	}
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
-	if s.cmd != nil {
-		_ = s.cmd.Wait()
+		s.cancel() // release lifecycle context resources
 	}
 	return nil
 }
@@ -481,7 +562,7 @@ func sshArgs(opts DialOptions) []string {
 		"-o", "BatchMode=yes", // never prompt; fail instead (non-interactive)
 		"-o", "StrictHostKeyChecking=" + strict,
 		"-o", "ServerAliveInterval=30", // keep long sessions alive
-		"-o", "ServerAliveCountMax=4",  // ~2 min of missed keepalives → drop
+		"-o", "ServerAliveCountMax=4", // ~2 min of missed keepalives → drop
 	}
 	if opts.Port != 0 && opts.Port != 22 {
 		a = append(a, "-p", strconv.Itoa(opts.Port))
@@ -524,110 +605,200 @@ func tshArgs(opts DialOptions) []string {
 	return a
 }
 
-// runOnce runs a one-shot command on the remote host and returns its stdout.
-// stderr is surfaced in the error if the command fails.  No PTY is requested.
-func runOnce(ctx context.Context, opts DialOptions, binary, remoteCmd string, stdin io.Reader) ([]byte, error) {
-	var c *exec.Cmd
-	if binary == "tsh" {
-		args := append(tshArgs(opts), opts.Host, remoteCmd)
-		c = exec.CommandContext(ctx, "tsh", append([]string{"ssh"}, args...)...)
-	} else {
-		args := append(sshArgs(opts), opts.Host, remoteCmd)
-		c = exec.CommandContext(ctx, "ssh", args...)
-	}
-	if stdin != nil {
-		c.Stdin = stdin
-	}
-	var out, errOut bytes.Buffer
-	c.Stdout = &out
-	c.Stderr = &errOut
-	if err := c.Run(); err != nil {
-		return nil, fmt.Errorf("%s %s: %w; stderr: %s", binary, opts.Host, err, strings.TrimSpace(errOut.String()))
-	}
-	return out.Bytes(), nil
-}
-
-func detectPlatform(ctx context.Context, opts DialOptions, binary string) (sysname, machine string, err error) {
-	out, err := runOnceFn(ctx, opts, binary, "uname -sm", nil)
-	if err != nil {
-		return "", "", err
-	}
-	fields := strings.Fields(strings.TrimSpace(string(out)))
-	if len(fields) != 2 {
-		return "", "", fmt.Errorf("unexpected uname output: %q", strings.TrimSpace(string(out)))
-	}
-	return fields[0], fields[1], nil
-}
-
-var runOnceFn = runOnce
 var binaryForUnameFn = embed.BinaryForUname
 
-func ensureInstalled(ctx context.Context, opts DialOptions, remotePath, sysname, machine, binary string) error {
-	// Check the installed version (if any) with a single one-shot command.
-	checkCmd := fmt.Sprintf(
-		`if [ -x %s ]; then %s remote --version; else echo __MISSING__; fi`,
-		remotePath, remotePath)
-	out, err := runOnceFn(ctx, opts, binary, checkCmd, nil)
-	if err != nil {
-		// Non-fatal: treat a hard failure as "needs install" and try uploading.
-		out = []byte("__MISSING__")
-	}
-	installed := parseReportedVersion(string(out))
-	if installed == version.Version {
-		return nil // up to date
-	}
+// marker returns a random, per-call sentinel token. It is assembled at runtime
+// on the remote via printf, so an echoed command line (which contains the
+// printf *format*, not the substituted value) can never contain the full
+// token — making marker matching robust even over a PTY before echo is off.
+func marker() (token, nonce string) {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	nonce = hex.EncodeToString(b[:])
+	return "__MHM_" + nonce + "__", nonce
+}
 
-	// Fetch the matching embedded binary.
-	bin, err := binaryForUnameFn(sysname, machine)
-	if err != nil {
-		return fmt.Errorf("no prebuilt remote binary for %s %s: %w", sysname, machine, err)
+// sync drains shell start-up noise (MOTD, banner, the echoed `stty` line for
+// tsh) up to a known point, so the first real sh() call sees only its own
+// output. It emits a sentinel via printf and reads until that sentinel.
+func (s *Session) sync() error {
+	tok, nonce := marker()
+	if _, err := io.WriteString(s.stdin, "printf '\\n__MHM_%s__\\n' '"+nonce+"'\n"); err != nil {
+		return err
 	}
+	for {
+		line, err := s.stdout.ReadString('\n')
+		if strings.Contains(line, tok) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("sync shell: %w", err)
+		}
+	}
+}
 
-	// Upload: stream the binary to `cat > remotePath` on the remote shell.
-	uploadCmd := fmt.Sprintf(
-		`mkdir -p %s && cat > %s && chmod +x %s`,
-		opts.RemoteInstallDir, remotePath, remotePath)
-	if _, err := runOnceFn(ctx, opts, binary, uploadCmd, bytes.NewReader(bin)); err != nil {
-		return fmt.Errorf("upload: %w", err)
+// sh runs one command in the remote shell and returns its stdout and exit
+// code. The command's output is bracketed between a begin sentinel and an end
+// sentinel (the latter carrying $?): sh discards everything up to the begin
+// sentinel — which absorbs an interactive shell's prompt and any bracketed-
+// paste escapes emitted before the command — then captures up to the end
+// sentinel. This works over both a raw PTY (tsh) and a plain pipe (ssh). The
+// sentinels are assembled at runtime by printf, so an echoed command line can
+// never contain the full sentinel and cause a false match.
+func (s *Session) sh(cmd string) (out string, code int, err error) {
+	_, nonce := marker()
+	beg := "__MHMBEG_" + nonce + "__"
+	end := "__MHMEND_" + nonce + "__"
+	full := "printf '\\n__MHMBEG_%s__\\n' '" + nonce + "'; { " + cmd +
+		" ; }; printf '\\n__MHMEND_%s__%s__\\n' '" + nonce + "' \"$?\"\n"
+	if _, err := io.WriteString(s.stdin, full); err != nil {
+		return "", 0, err
+	}
+	// Phase 1: discard everything up to and including the begin sentinel.
+	for {
+		line, rerr := s.stdout.ReadString('\n')
+		if strings.Contains(line, beg) {
+			break
+		}
+		if rerr != nil {
+			return "", 0, fmt.Errorf("shell command %q: %w", cmd, rerr)
+		}
+	}
+	// Phase 2: capture output up to the end sentinel and parse the exit code.
+	var b strings.Builder
+	for {
+		line, rerr := s.stdout.ReadString('\n')
+		if idx := strings.Index(line, end); idx >= 0 {
+			b.WriteString(line[:idx])
+			rest := line[idx+len(end):]
+			if e := strings.Index(rest, "__"); e >= 0 {
+				code, _ = strconv.Atoi(strings.TrimSpace(rest[:e]))
+			}
+			return strings.TrimRight(b.String(), "\r\n"), code, nil
+		}
+		b.WriteString(line)
+		if rerr != nil {
+			return "", 0, fmt.Errorf("shell command %q: %w", cmd, rerr)
+		}
+	}
+}
+
+// upload writes bin to remotePath on the remote via a base64 heredoc. base64
+// keeps the payload to a safe text alphabet (no NULs, no long lines, cannot
+// clash with the heredoc delimiter), so it streams cleanly over a raw PTY or a
+// pipe. The decoder flag differs by OS: GNU/Linux uses `-d`, BSD/macOS `-D`.
+func (s *Session) upload(remotePath, installDir, sysname string, bin []byte) error {
+	decode := "-d"
+	if sysname == "Darwin" {
+		decode = "-D"
+	}
+	_, nonce := marker()
+	delim := "__MHM_DATA_" + nonce + "__"
+	enc := base64.StdEncoding.EncodeToString(bin)
+
+	var b strings.Builder
+	b.WriteString("mkdir -p " + installDir + " && base64 " + decode + " > " + remotePath + " <<'" + delim + "'\n")
+	for len(enc) > 76 {
+		b.WriteString(enc[:76])
+		b.WriteByte('\n')
+		enc = enc[76:]
+	}
+	b.WriteString(enc)
+	b.WriteByte('\n')
+	b.WriteString(delim + "\n")
+	if _, err := io.WriteString(s.stdin, b.String()); err != nil {
+		return err
+	}
+	// Finalize + confirm success through the marker protocol.
+	if _, code, err := s.sh("chmod +x " + remotePath); err != nil {
+		return err
+	} else if code != 0 {
+		return fmt.Errorf("chmod remote binary: exit %d", code)
 	}
 	return nil
 }
 
-// startRemote launches the persistent remote myhostmcp process.
+// bringUp performs the whole bootstrap over the single shell opened by
+// startShell: detect platform, install/upgrade the binary if needed, then
+// hand the shell off to the persistent `myhostmcp remote` process.
+func (s *Session) bringUp(opts DialOptions, remotePath, binary string) error {
+	// Drain start-up noise so the first sh() sees only its own output.
+	if err := s.sync(); err != nil {
+		return err
+	}
+
+	// 1. Detect the remote platform.
+	out, code, err := s.sh("uname -sm")
+	if err != nil {
+		return fmt.Errorf("detect platform: %w", err)
+	}
+	if code != 0 {
+		return fmt.Errorf("detect platform: uname exited %d", code)
+	}
+	fields := strings.Fields(strings.TrimSpace(out))
+	if len(fields) != 2 {
+		return fmt.Errorf("detect platform: unexpected uname output: %q", out)
+	}
+	sysname, machine := fields[0], fields[1]
+	s.Platform = sysname + " " + machine
+
+	// 2. Ensure the remote binary is present and version-current.
+	check := fmt.Sprintf("if [ -x %s ]; then %s remote --version; else echo __MISSING__; fi", remotePath, remotePath)
+	out, _, err = s.sh(check)
+	if err != nil {
+		return fmt.Errorf("version check: %w", err)
+	}
+	if parseReportedVersion(out) != version.Version {
+		bin, err := binaryForUnameFn(sysname, machine)
+		if err != nil {
+			return fmt.Errorf("no prebuilt remote binary for %s %s: %w", sysname, machine, err)
+		}
+		if err := s.upload(remotePath, opts.RemoteInstallDir, sysname, bin); err != nil {
+			return fmt.Errorf("upload: %w", err)
+		}
+	}
+
+	// 3. Hand the shell off to the persistent process with exec, so it takes
+	//    over this same session instead of opening a new one. For tsh the PTY
+	//    merges stdout+stderr, so the binary's stderr is redirected to a log
+	//    file to keep it out of the JSON stream; for ssh, stderr stays on its
+	//    own pipe and flows to s.Stderr().
+	handoff := "exec " + remotePath + " remote\n"
+	if binary == "tsh" {
+		handoff = "exec " + remotePath + " remote 2>>" + opts.RemoteInstallDir + "/remote.log\n"
+	}
+	if _, err := io.WriteString(s.stdin, handoff); err != nil {
+		return fmt.Errorf("handoff: %w", err)
+	}
+	return nil
+}
+
+// startShell opens the single persistent shell used for a whole connection.
+// It passes NO command argument to ssh/tsh so exactly one SSH session (and one
+// authentication) is created per Dial. bringUp then drives platform detection,
+// installation, and the handoff over this shell's stdin/stdout.
 //
-// See the package-level doc for the PTY / session-recording strategy.
-func startRemote(_ context.Context, opts DialOptions, remotePath, binary string) (*Session, error) {
+// tsh: a PTY is requested (-tt) so Teleport records one interactive shell
+// session, and the PTY is switched to raw mode so its CRLF/echo processing
+// cannot corrupt the JSON framing. ssh: no PTY, so stdout and stderr stay on
+// separate pipes and the remote binary's logs flow to s.Stderr().
+func startShell(opts DialOptions, binary string) (*Session, error) {
 	// The persistent process must outlive the MCP request that initiated it:
 	// the SDK cancels the request context once the tool handler returns, which
 	// would kill a CommandContext bound to it.  Use a background-derived
 	// lifecycle context cancelled on Session.Close instead.
 	lctx, cancel := context.WithCancel(context.Background())
 
-	var (
-		c       *exec.Cmd
-		initCmd string // non-empty → written to stdin after Start()
-	)
-
+	var c *exec.Cmd
 	if binary == "tsh" {
-		// NO command argument: tsh sends an SSH "shell" request so Teleport
-		// treats the session as interactive and records it.
-		// -tt: force PTY allocation even though our local stdin is a pipe.
+		// -tt: force PTY allocation even though our local stdin is a pipe, so
+		// Teleport classifies this as an interactive shell session.
 		args := append(tshArgs(opts), "-tt", opts.Host)
 		c = exec.CommandContext(lctx, "tsh", append([]string{"ssh"}, args...)...)
-		// The startup sequence is sent to the shell via stdin immediately after
-		// Start().  The shell executes it and then myhostmcp remote takes over.
-		// stty raw -echo: suppress PTY CRLF translation (ONLCR) and input echo.
-		// The binary's stderr must be kept out of the PTY data stream (the PTY
-		// merges stdout and stderr, which would corrupt our JSON framing), but
-		// discarding it hides startup failures. Redirect it to a log file in the
-		// install dir instead, so `waiting for remote ready` timeouts remain
-		// diagnosable on the host. RemoteInstallDir is config-trusted and
-		// safe-path validated, so it is safe to inject unquoted.
-		logPath := opts.RemoteInstallDir + "/remote.log"
-		initCmd = "stty raw -echo 2>/dev/null; " + remotePath + " remote 2>>" + logPath + "\n"
 	} else {
-		// Plain ssh: run the binary directly; no PTY, separate stderr pipe.
-		args := append(sshArgs(opts), opts.Host, remotePath+" remote")
+		// No command and no PTY: ssh still requests a shell session, reading
+		// our commands from the stdin pipe, with stderr on its own pipe.
+		args := append(sshArgs(opts), opts.Host)
 		c = exec.CommandContext(lctx, "ssh", args...)
 	}
 
@@ -651,13 +822,17 @@ func startRemote(_ context.Context, opts DialOptions, remotePath, binary string)
 		return nil, fmt.Errorf("start %s: %w", binary, err)
 	}
 
-	if initCmd != "" {
-		// Write the startup command to the remote shell's stdin. The pipe
-		// buffer is large enough that this never blocks at start-up.
-		if _, err := io.WriteString(stdin, initCmd); err != nil {
+	if binary == "tsh" {
+		// Put the PTY into raw mode before any bootstrap so ONLCR (CRLF) output
+		// translation and input echo cannot corrupt the JSON framing, and quiet
+		// the interactive shell's prompt so it does not interleave with output.
+		// Any remaining banner/echo is drained by sync() and by sh()'s begin
+		// sentinel. The escapes are best-effort (2>/dev/null / unset).
+		init := "stty raw -echo 2>/dev/null; PS1=''; PROMPT_COMMAND=''; unset PROMPT_COMMAND 2>/dev/null\n"
+		if _, err := io.WriteString(stdin, init); err != nil {
 			_ = c.Process.Kill()
 			cancel()
-			return nil, fmt.Errorf("write tsh startup command: %w", err)
+			return nil, fmt.Errorf("init tsh shell: %w", err)
 		}
 	}
 

@@ -1,8 +1,12 @@
 package transport
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"io"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -130,35 +134,150 @@ func TestTransportPersistent(t *testing.T) {
 
 // safeAllowedCommand returns a harmless invocation of an allowed entry, or ""
 // if none of the allowed entries are known-safe to run (e.g. only `top`).
-func TestEnsureInstalledSkipsWhenVersionMatches(t *testing.T) {
-	origRunOnce := runOnceFn
+// fakeShell emulates just enough of a remote shell to exercise the marker
+// protocol used by bringUp: it reads the sentinel-carrying command lines the
+// Session writes, extracts the per-call nonce, and replies with canned output
+// followed by the matching `__MHM_<nonce>__<code>__END__` (or the bare sync
+// sentinel). It records which logical commands it saw and whether a base64
+// upload heredoc was streamed.
+type fakeShell struct {
+	in  *bufio.Reader // commands written by the Session
+	out io.Writer     // shell stdout the Session reads
+
+	sawUpload bool
+	commands  []string
+}
+
+var (
+	syncRe = regexp.MustCompile(`^printf '\\n__MHM_%s__\\n' '([0-9a-f]+)'`)
+	shRe   = regexp.MustCompile(`^printf '\\n__MHMBEG_%s__\\n' '([0-9a-f]+)'; \{ (.*) ; \}; printf '\\n__MHMEND_%s__%s__\\n'`)
+)
+
+// run drives the fake shell until it sees the exec handoff line (or EOF).
+func (f *fakeShell) run(handler func(cmd string) (string, int)) {
+	for {
+		line, err := f.in.ReadString('\n')
+		if line != "" {
+			f.dispatch(strings.TrimRight(line, "\n"), handler)
+			if strings.HasPrefix(strings.TrimSpace(line), "exec ") {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (f *fakeShell) dispatch(line string, handler func(cmd string) (string, int)) {
+	if m := syncRe.FindStringSubmatch(line); m != nil {
+		fmt.Fprintf(f.out, "\n__MHM_%s__\n", m[1])
+		return
+	}
+	if m := shRe.FindStringSubmatch(line); m != nil {
+		nonce, cmd := m[1], m[2]
+		f.commands = append(f.commands, cmd)
+		out, code := handler(cmd)
+		fmt.Fprintf(f.out, "\n__MHMBEG_%s__\n", nonce)
+		if out != "" {
+			fmt.Fprint(f.out, out)
+		}
+		fmt.Fprintf(f.out, "\n__MHMEND_%s__%s__\n", nonce, strconv.Itoa(code))
+		return
+	}
+	if strings.Contains(line, "base64") && strings.Contains(line, "<<'__MHM_DATA_") {
+		f.sawUpload = true
+	}
+}
+
+// newFakeSession wires a Session's stdin/stdout to an in-memory fake shell and
+// returns the session plus a channel that closes when the fake shell's run loop
+// exits (i.e. after it sees the exec handoff).
+func newFakeSession(t *testing.T, handler func(cmd string) (string, int)) (*Session, *fakeShell, <-chan struct{}) {
+	t.Helper()
+	cmdR, cmdW := io.Pipe() // Session writes commands → fake shell reads
+	outR, outW := io.Pipe() // fake shell writes output → Session reads
+	fsh := &fakeShell{in: bufio.NewReader(cmdR), out: outW}
+	s := &Session{
+		stdin:   cmdW,
+		stdout:  bufio.NewReaderSize(outR, 64*1024),
+		writeMu: make(chan struct{}, 1),
+		rpcMu:   make(chan struct{}, 1),
+		closed:  make(chan struct{}),
+	}
+	done := make(chan struct{})
+	go func() {
+		fsh.run(handler)
+		close(done)
+	}()
+	return s, fsh, done
+}
+
+func TestBringUpSkipsUploadWhenVersionMatches(t *testing.T) {
 	origBinary := binaryForUnameFn
-	t.Cleanup(func() {
-		runOnceFn = origRunOnce
-		binaryForUnameFn = origBinary
+	t.Cleanup(func() { binaryForUnameFn = origBinary })
+	binaryForUnameFn = func(_, _ string) ([]byte, error) {
+		t.Fatalf("binaryForUname must not be called when versions match")
+		return nil, nil
+	}
+
+	s, fsh, done := newFakeSession(t, func(cmd string) (string, int) {
+		switch {
+		case cmd == "uname -sm":
+			return "Linux x86_64\n", 0
+		case strings.Contains(cmd, "remote --version"):
+			return "myhostmcp " + version.Version + "\n", 0
+		default:
+			return "", 0
+		}
 	})
 
-	uploaded := false
-	runOnceFn = func(_ context.Context, _ DialOptions, _, remoteCmd string, stdin io.Reader) ([]byte, error) {
-		if strings.Contains(remoteCmd, "remote --version") {
-			return []byte("myhostmcp " + version.Version + "\n"), nil
-		}
-		if stdin != nil {
-			uploaded = true
-		}
-		return nil, nil
+	if err := s.bringUp(DialOptions{RemoteInstallDir: "~/.myhostmcp"}, "~/.myhostmcp/myhostmcp", "ssh"); err != nil {
+		t.Fatalf("bringUp: %v", err)
 	}
-	binaryForUnameFn = func(_, _ string) ([]byte, error) {
-		t.Fatalf("binaryForUname should not be called when versions match")
-		return nil, nil
+	<-done
+
+	if s.Platform != "Linux x86_64" {
+		t.Fatalf("platform = %q, want %q", s.Platform, "Linux x86_64")
+	}
+	if fsh.sawUpload {
+		t.Fatalf("unexpected upload when versions match")
+	}
+}
+
+func TestBringUpUploadsWhenMissing(t *testing.T) {
+	origBinary := binaryForUnameFn
+	t.Cleanup(func() { binaryForUnameFn = origBinary })
+	called := false
+	binaryForUnameFn = func(sysname, machine string) ([]byte, error) {
+		called = true
+		if sysname != "Linux" || machine != "x86_64" {
+			t.Fatalf("binaryForUname(%q,%q): unexpected platform", sysname, machine)
+		}
+		return []byte("fake-binary-bytes"), nil
 	}
 
-	err := ensureInstalled(context.Background(), DialOptions{Host: "dummy"}, "~/.myhostmcp/myhostmcp", "Linux", "x86_64", "ssh")
-	if err != nil {
-		t.Fatalf("ensureInstalled: %v", err)
+	s, fsh, done := newFakeSession(t, func(cmd string) (string, int) {
+		switch {
+		case cmd == "uname -sm":
+			return "Linux x86_64\n", 0
+		case strings.Contains(cmd, "remote --version"):
+			return "__MISSING__\n", 0
+		default: // chmod after upload
+			return "", 0
+		}
+	})
+
+	if err := s.bringUp(DialOptions{RemoteInstallDir: "~/.myhostmcp"}, "~/.myhostmcp/myhostmcp", "tsh"); err != nil {
+		t.Fatalf("bringUp: %v", err)
 	}
-	if uploaded {
-		t.Fatalf("unexpected upload when versions match")
+	<-done
+
+	if !called {
+		t.Fatalf("binaryForUname should have been called when the binary is missing")
+	}
+	if !fsh.sawUpload {
+		t.Fatalf("expected a base64 upload heredoc when the binary is missing")
 	}
 }
 
