@@ -61,6 +61,18 @@ type Config struct {
 	// passed as a positional argument to `tsh login`.  If empty, the default
 	// cluster for the proxy is used.
 	TeleportCluster string `yaml:"teleportCluster"`
+
+	// RawProtocol disables recording-friendly framing on the tsh (Teleport)
+	// transport, reverting to the raw newline-JSON protocol. By default (false),
+	// tsh sessions use recording-friendly framing: the remote half emits a
+	// human-readable transcript to the recorded PTY and carries the structured
+	// protocol inside an invisible APC escape sequence, so Teleport session
+	// replays read like a real shell session while the agent still receives
+	// structured output. Set true to opt out — e.g. to avoid output duplication
+	// for very large command outputs, or if your replay tooling does not discard
+	// APC escape sequences. No effect on the ssh transport, which is never
+	// recorded and always uses the raw protocol.
+	RawProtocol bool `yaml:"rawProtocol"`
 }
 
 // Default returns the built-in defaults.

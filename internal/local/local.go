@@ -268,6 +268,7 @@ func (m *Manager) handleConnect(ctx context.Context, _ *mcp.CallToolRequest, in 
 		TransportBinary:       tBinary,
 		TeleportProxy:         tProxy,
 		TeleportCluster:       tCluster,
+		RecordingFriendly:     !m.cfg.RawProtocol, // default on for tsh; rawProtocol opts out
 		// Stream tsh login output (including the browser URL) to the log in
 		// real time so headless users can see the URL without waiting for
 		// login to complete.  The same output is included in LoginNote on

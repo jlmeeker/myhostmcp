@@ -213,12 +213,18 @@ func newFakeSession(t *testing.T, handler func(cmd string) (string, int)) (*Sess
 	return s, fsh, done
 }
 
-func TestBringUpSkipsUploadWhenVersionMatches(t *testing.T) {
+func TestBringUpSkipsUploadWhenHashMatches(t *testing.T) {
 	origBinary := binaryForUnameFn
 	t.Cleanup(func() { binaryForUnameFn = origBinary })
-	binaryForUnameFn = func(_, _ string) ([]byte, error) {
-		t.Fatalf("binaryForUname must not be called when versions match")
-		return nil, nil
+	fakeBin := []byte("fake-remote-binary-bytes-v1")
+	binaryForUnameFn = func(_, _ string) ([]byte, error) { return fakeBin, nil }
+	wantHash := sha256Hex(fakeBin)
+
+	origSCP := scpRunner
+	t.Cleanup(func() { scpRunner = origSCP })
+	scpRunner = func(context.Context, string, []string) error {
+		t.Fatalf("scp must not run when the remote hash matches")
+		return nil
 	}
 
 	s, fsh, done := newFakeSession(t, func(cmd string) (string, int) {
@@ -226,13 +232,14 @@ func TestBringUpSkipsUploadWhenVersionMatches(t *testing.T) {
 		case cmd == "uname -sm":
 			return "Linux x86_64\n", 0
 		case strings.Contains(cmd, "remote --version"):
-			return "myhostmcp " + version.Version + "\n", 0
+			// Remote reports the SAME hash -> no upload expected.
+			return "myhostmcp " + version.Version + " " + wantHash + "\n", 0
 		default:
 			return "", 0
 		}
 	})
 
-	if err := s.bringUp(DialOptions{RemoteInstallDir: "~/.myhostmcp"}, "~/.myhostmcp/myhostmcp", "ssh"); err != nil {
+	if err := s.bringUp(context.Background(), DialOptions{RemoteInstallDir: "~/.myhostmcp"}, "~/.myhostmcp/myhostmcp", "ssh"); err != nil {
 		t.Fatalf("bringUp: %v", err)
 	}
 	<-done
@@ -241,20 +248,63 @@ func TestBringUpSkipsUploadWhenVersionMatches(t *testing.T) {
 		t.Fatalf("platform = %q, want %q", s.Platform, "Linux x86_64")
 	}
 	if fsh.sawUpload {
-		t.Fatalf("unexpected upload when versions match")
+		t.Fatalf("unexpected upload when hashes match")
 	}
 }
 
-func TestBringUpUploadsWhenMissing(t *testing.T) {
+func TestBringUpUploadsViaSCPWhenHashDiffers(t *testing.T) {
 	origBinary := binaryForUnameFn
 	t.Cleanup(func() { binaryForUnameFn = origBinary })
-	called := false
-	binaryForUnameFn = func(sysname, machine string) ([]byte, error) {
-		called = true
-		if sysname != "Linux" || machine != "x86_64" {
-			t.Fatalf("binaryForUname(%q,%q): unexpected platform", sysname, machine)
+	binaryForUnameFn = func(_, _ string) ([]byte, error) { return []byte("new-bytes"), nil }
+
+	origSCP := scpRunner
+	t.Cleanup(func() { scpRunner = origSCP })
+	var scpProg string
+	var scpArgs []string
+	scpRunner = func(_ context.Context, prog string, args []string) error {
+		scpProg, scpArgs = prog, args
+		return nil // simulate a successful transfer
+	}
+
+	s, fsh, done := newFakeSession(t, func(cmd string) (string, int) {
+		switch {
+		case cmd == "uname -sm":
+			return "Linux x86_64\n", 0
+		case strings.Contains(cmd, "remote --version"):
+			// Same version tag, but a DIFFERENT hash -> must re-upload.
+			return "myhostmcp " + version.Version + " " + sha256Hex([]byte("old-bytes")) + "\n", 0
+		case strings.Contains(cmd, "&& pwd"):
+			return "/home/tester/.myhostmcp\n", 0
+		default: // chmod after upload
+			return "", 0
 		}
-		return []byte("fake-binary-bytes"), nil
+	})
+
+	if err := s.bringUp(context.Background(), DialOptions{RemoteInstallDir: "~/.myhostmcp", Host: "h", User: "u"}, "~/.myhostmcp/myhostmcp", "tsh"); err != nil {
+		t.Fatalf("bringUp: %v", err)
+	}
+	<-done
+
+	if scpProg != "tsh" {
+		t.Fatalf("expected transfer via tsh scp, got prog=%q", scpProg)
+	}
+	if len(scpArgs) < 2 || scpArgs[len(scpArgs)-1] != "u@h:/home/tester/.myhostmcp/myhostmcp" {
+		t.Fatalf("unexpected scp args (destination): %v", scpArgs)
+	}
+	if fsh.sawUpload {
+		t.Fatalf("heredoc fallback should not run when scp succeeds")
+	}
+}
+
+func TestBringUpFallsBackToHeredocWhenSCPFails(t *testing.T) {
+	origBinary := binaryForUnameFn
+	t.Cleanup(func() { binaryForUnameFn = origBinary })
+	binaryForUnameFn = func(_, _ string) ([]byte, error) { return []byte("fake-binary-bytes"), nil }
+
+	origSCP := scpRunner
+	t.Cleanup(func() { scpRunner = origSCP })
+	scpRunner = func(context.Context, string, []string) error {
+		return fmt.Errorf("file transfer disabled by policy") // force fallback
 	}
 
 	s, fsh, done := newFakeSession(t, func(cmd string) (string, int) {
@@ -263,21 +313,20 @@ func TestBringUpUploadsWhenMissing(t *testing.T) {
 			return "Linux x86_64\n", 0
 		case strings.Contains(cmd, "remote --version"):
 			return "__MISSING__\n", 0
+		case strings.Contains(cmd, "&& pwd"):
+			return "/home/tester/.myhostmcp\n", 0
 		default: // chmod after upload
 			return "", 0
 		}
 	})
 
-	if err := s.bringUp(DialOptions{RemoteInstallDir: "~/.myhostmcp"}, "~/.myhostmcp/myhostmcp", "tsh"); err != nil {
+	if err := s.bringUp(context.Background(), DialOptions{RemoteInstallDir: "~/.myhostmcp", Host: "h"}, "~/.myhostmcp/myhostmcp", "tsh"); err != nil {
 		t.Fatalf("bringUp: %v", err)
 	}
 	<-done
 
-	if !called {
-		t.Fatalf("binaryForUname should have been called when the binary is missing")
-	}
 	if !fsh.sawUpload {
-		t.Fatalf("expected a base64 upload heredoc when the binary is missing")
+		t.Fatalf("expected base64-over-PTY heredoc fallback when scp fails")
 	}
 }
 
@@ -290,6 +339,21 @@ func TestParseReportedVersion(t *testing.T) {
 	for in, want := range cases {
 		if got := parseReportedVersion(in); got != want {
 			t.Fatalf("parseReportedVersion(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
+func TestParseReportedHash(t *testing.T) {
+	cases := map[string]string{
+		"myhostmcp 0.2.0-dev abc123\n":            "abc123",
+		"banner line\nmyhostmcp 1.0.0 deadbeef\n": "deadbeef", // hash on a later line
+		"myhostmcp 0.2.0-dev\n":                   "",         // old binary: no hash
+		"__MISSING__\n":                           "",
+		"":                                        "",
+	}
+	for in, want := range cases {
+		if got := parseReportedHash(in); got != want {
+			t.Fatalf("parseReportedHash(%q)=%q want %q", in, got, want)
 		}
 	}
 }

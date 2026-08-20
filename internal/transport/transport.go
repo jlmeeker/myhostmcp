@@ -62,11 +62,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -121,6 +123,15 @@ type DialOptions struct {
 	// cluster for the proxy is used.
 	TeleportCluster string
 
+	// RecordingFriendly, when true and the tsh transport is used, starts the
+	// remote half in APC framing mode: responses are wrapped in an invisible
+	// APC envelope and a human-readable transcript is emitted alongside them so
+	// Teleport session recordings play back as a readable shell session. It has
+	// no effect on the ssh transport (which is not recorded). Callers (the local
+	// half) enable this by default for tsh; it is disabled via the rawProtocol
+	// config opt-out.
+	RecordingFriendly bool
+
 	// LoginProgressWriter, if non-nil, receives tsh login output (including
 	// the browser URL line) in real time as tsh login runs.  In headless
 	// environments where the browser cannot open automatically, tsh prints a
@@ -151,6 +162,13 @@ type Session struct {
 	rpcMu   chan struct{}
 	closed  chan struct{}
 	cancel  context.CancelFunc
+
+	// apc is set when the remote half was started in APC framing mode; recv
+	// then extracts responses from APC envelopes instead of JSON lines. nonce
+	// is learned from the first (ready) frame and used to reject spoofed
+	// frames injected by command output.
+	apc   bool
+	nonce string
 }
 
 // Dial connects to the host, ensures the remote half is installed and
@@ -253,7 +271,7 @@ func dialWith(ctx context.Context, opts DialOptions, binary string) (*Session, e
 	//    Bounded by ctx: bringUp's reads block on the pipe, so on timeout we
 	//    kill the session (closing the pipe) to unblock the goroutine.
 	errc := make(chan error, 1)
-	go func() { errc <- s.bringUp(opts, remotePath, binary) }()
+	go func() { errc <- s.bringUp(ctx, opts, remotePath, binary) }()
 	select {
 	case err := <-errc:
 		if err != nil {
@@ -403,6 +421,9 @@ func (s *Session) RoundTrip(req *protocol.Request) (*protocol.Response, error) {
 }
 
 func (s *Session) recv() (*protocol.Response, error) {
+	if s.apc {
+		return s.recvAPC()
+	}
 	for {
 		line, err := s.stdout.ReadString('\n')
 
@@ -447,6 +468,101 @@ func parseResponseLine(line string) (*protocol.Response, bool) {
 		// text); try the next one.
 	}
 	return nil, false
+}
+
+// recvAPC reads one protocol.Response from an APC-framed stream (recording-
+// friendly mode). It scans the channel for APC envelopes, ignoring the human-
+// readable transcript (and any stray APC sequences in command output), and
+// returns the first envelope whose payload carries the session nonce. The
+// nonce is established by the first frame (the remote's "ready"), which cannot
+// be preceded by command output, and thereafter authenticates every frame so
+// output cannot spoof a response.
+func (s *Session) recvAPC() (*protocol.Response, error) {
+	for {
+		payload, err := s.readAPCFrame()
+		if err != nil {
+			return nil, fmt.Errorf("read from %s: %w", s.Transport, err)
+		}
+		if !strings.HasPrefix(payload, protocol.APCTag) {
+			continue // not one of ours (e.g. an APC emitted by a command)
+		}
+		rest := payload[len(protocol.APCTag):]
+		brace := strings.IndexByte(rest, '{')
+		if brace < 0 {
+			continue
+		}
+		nonce := rest[:brace]
+		if s.nonce == "" {
+			s.nonce = nonce // first frame (ready) establishes the session nonce
+		} else if nonce != s.nonce {
+			continue // foreign/spoofed frame; ignore
+		}
+		var resp protocol.Response
+		if err := json.Unmarshal([]byte(rest[brace:]), &resp); err == nil && resp.Type != "" {
+			return &resp, nil
+		}
+		// Malformed JSON in a nonce-tagged frame: keep scanning.
+	}
+}
+
+// readAPCFrame reads bytes from the channel and returns the payload of the next
+// APC string (the bytes between the ESC '_' introducer and the ESC '\'
+// terminator). It is robust to arbitrary transcript bytes and to stray/partial
+// APC-like sequences in command output: a genuine payload is pure JSON with no
+// raw ESC byte, so any ESC that is not the terminator or a fresh introducer
+// means the current candidate is not ours and the scan restarts.
+func (s *Session) readAPCFrame() (string, error) {
+	const esc = 0x1b
+	for {
+		// Phase A: scan for the APC introducer ESC '_'.
+		for {
+			b, err := s.stdout.ReadByte()
+			if err != nil {
+				return "", err
+			}
+			if b != esc {
+				continue
+			}
+			b2, err := s.stdout.ReadByte()
+			if err != nil {
+				return "", err
+			}
+			if b2 == '_' {
+				break // introducer found
+			}
+			// Some other ESC sequence (e.g. a color code in the transcript);
+			// keep scanning.
+		}
+		// Phase B: collect the payload until the String Terminator ESC '\'.
+		var sb strings.Builder
+		aborted := false
+		for {
+			b, err := s.stdout.ReadByte()
+			if err != nil {
+				return "", err
+			}
+			if b != esc {
+				sb.WriteByte(b)
+				continue
+			}
+			b2, err := s.stdout.ReadByte()
+			if err != nil {
+				return "", err
+			}
+			switch b2 {
+			case '\\':
+				return sb.String(), nil // complete frame
+			case '_':
+				sb.Reset() // a fresh introducer; restart collection
+			default:
+				aborted = true // stray ESC seq; abandon this candidate
+			}
+			if aborted {
+				break
+			}
+		}
+		// aborted: fall through to Phase A and resume scanning.
+	}
 }
 
 // recvReady waits for the remote's first protocol message (its "ready"
@@ -718,10 +834,126 @@ func (s *Session) upload(remotePath, installDir, sysname string, bin []byte) err
 	return nil
 }
 
+// scpRunner runs the external file-transfer program (scp / tsh scp). It is a
+// package var so tests can stub the transfer without touching the network.
+var scpRunner = func(ctx context.Context, prog string, args []string) error {
+	cmd := exec.CommandContext(ctx, prog, args...)
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(errBuf.String()); msg != "" {
+			return fmt.Errorf("%s: %w: %s", prog, err, msg)
+		}
+		return fmt.Errorf("%s: %w", prog, err)
+	}
+	return nil
+}
+
+// installBinary places the remote binary on the host. It prefers a native file
+// transfer (scp / tsh scp), which is fast and robust, and falls back to the
+// base64-over-PTY heredoc (see upload) if the transfer fails — e.g. because
+// file transfer is disabled by Teleport role policy.
+func (s *Session) installBinary(ctx context.Context, opts DialOptions, binary, remotePath, sysname string, bin []byte) error {
+	if err := s.uploadViaSCP(ctx, opts, binary, opts.RemoteInstallDir, bin); err == nil {
+		return nil
+	} else if ferr := s.upload(remotePath, opts.RemoteInstallDir, sysname, bin); ferr != nil {
+		return fmt.Errorf("scp transfer failed (%v); base64-over-PTY fallback also failed: %w", err, ferr)
+	}
+	return nil
+}
+
+// uploadViaSCP copies bin to the remote install dir using scp (or tsh scp).
+// The install dir is created and resolved to an absolute path over the already-
+// open shell first (where ~ expands), because scp — which now uses SFTP under
+// the hood — does not reliably expand ~ in the destination path.
+func (s *Session) uploadViaSCP(ctx context.Context, opts DialOptions, binary, installDir string, bin []byte) error {
+	out, code, err := s.sh("mkdir -p " + installDir + " && cd " + installDir + " && pwd")
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("prepare remote install dir: exit %d", code)
+	}
+	absDir := lastNonEmptyLine(out)
+	if !strings.HasPrefix(absDir, "/") {
+		return fmt.Errorf("could not resolve remote install dir (got %q)", absDir)
+	}
+	absPath := absDir + "/myhostmcp"
+
+	tmp, err := os.CreateTemp("", "myhostmcp-remote-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(bin); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	_ = os.Chmod(tmpName, 0o755)
+
+	target := opts.Host + ":" + absPath
+	if opts.User != "" {
+		target = opts.User + "@" + target
+	}
+
+	var prog string
+	var args []string
+	if binary == "tsh" {
+		prog = "tsh"
+		args = []string{"scp", "-q"}
+		if opts.Port != 0 && opts.Port != 22 {
+			args = append(args, "-P", strconv.Itoa(opts.Port))
+		}
+		args = append(args, tmpName, target)
+	} else {
+		prog = "scp"
+		strict := opts.StrictHostKeyChecking
+		if strict == "" {
+			strict = "accept-new"
+		}
+		args = []string{"-B", "-q", "-o", "StrictHostKeyChecking=" + strict}
+		if opts.Port != 0 && opts.Port != 22 {
+			args = append(args, "-P", strconv.Itoa(opts.Port))
+		}
+		for _, f := range opts.IdentityFiles {
+			if f != "" {
+				args = append(args, "-i", f)
+			}
+		}
+		args = append(args, tmpName, target)
+	}
+
+	if err := scpRunner(ctx, prog, args); err != nil {
+		return err
+	}
+
+	if _, code, err := s.sh("chmod +x " + absPath); err != nil {
+		return err
+	} else if code != 0 {
+		return fmt.Errorf("chmod remote binary: exit %d", code)
+	}
+	return nil
+}
+
+// lastNonEmptyLine returns the last non-blank, whitespace-trimmed line of s.
+func lastNonEmptyLine(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
 // bringUp performs the whole bootstrap over the single shell opened by
 // startShell: detect platform, install/upgrade the binary if needed, then
 // hand the shell off to the persistent `myhostmcp remote` process.
-func (s *Session) bringUp(opts DialOptions, remotePath, binary string) error {
+func (s *Session) bringUp(ctx context.Context, opts DialOptions, remotePath, binary string) error {
 	// Drain start-up noise so the first sh() sees only its own output.
 	if err := s.sync(); err != nil {
 		return err
@@ -742,18 +974,26 @@ func (s *Session) bringUp(opts DialOptions, remotePath, binary string) error {
 	sysname, machine := fields[0], fields[1]
 	s.Platform = sysname + " " + machine
 
-	// 2. Ensure the remote binary is present and version-current.
+	// 2. Ensure the remote binary is present and byte-identical to the one we
+	//    embed. The decision is driven by the binary's content hash, not the
+	//    version tag: dev builds keep the same version string, so a tag compare
+	//    would leave a stale remote in place. We fetch the embedded binary up
+	//    front so we can both hash it and upload it if needed; the remote reports
+	//    the SHA-256 of its own file via `remote --version`. An old remote that
+	//    predates hash reporting yields an empty hash, which counts as a mismatch
+	//    and triggers a refresh.
+	bin, err := binaryForUnameFn(sysname, machine)
+	if err != nil {
+		return fmt.Errorf("no prebuilt remote binary for %s %s: %w", sysname, machine, err)
+	}
+	wantHash := sha256Hex(bin)
 	check := fmt.Sprintf("if [ -x %s ]; then %s remote --version; else echo __MISSING__; fi", remotePath, remotePath)
 	out, _, err = s.sh(check)
 	if err != nil {
 		return fmt.Errorf("version check: %w", err)
 	}
-	if parseReportedVersion(out) != version.Version {
-		bin, err := binaryForUnameFn(sysname, machine)
-		if err != nil {
-			return fmt.Errorf("no prebuilt remote binary for %s %s: %w", sysname, machine, err)
-		}
-		if err := s.upload(remotePath, opts.RemoteInstallDir, sysname, bin); err != nil {
+	if parseReportedHash(out) != wantHash {
+		if err := s.installBinary(ctx, opts, binary, remotePath, sysname, bin); err != nil {
 			return fmt.Errorf("upload: %w", err)
 		}
 	}
@@ -765,7 +1005,14 @@ func (s *Session) bringUp(opts DialOptions, remotePath, binary string) error {
 	//    own pipe and flows to s.Stderr().
 	handoff := "exec " + remotePath + " remote\n"
 	if binary == "tsh" {
-		handoff = "exec " + remotePath + " remote 2>>" + opts.RemoteInstallDir + "/remote.log\n"
+		remoteArgs := "remote"
+		if opts.RecordingFriendly {
+			// Recording-friendly framing is only meaningful on tsh, whose PTY
+			// session Teleport records. Enable it and switch recv() to APC mode.
+			remoteArgs = "remote --apc"
+			s.apc = true
+		}
+		handoff = "exec " + remotePath + " " + remoteArgs + " 2>>" + opts.RemoteInstallDir + "/remote.log\n"
 	}
 	if _, err := io.WriteString(s.stdin, handoff); err != nil {
 		return fmt.Errorf("handoff: %w", err)
@@ -864,4 +1111,25 @@ func parseReportedVersion(raw string) string {
 		return fields[0]
 	}
 	return raw
+}
+
+// parseReportedHash extracts the self-hash from `remote --version` output of
+// the form "myhostmcp <version> <sha256>". It returns "" if no hash is present
+// (an older remote binary, a missing binary, or unexpected output) — which the
+// caller treats as a mismatch and refreshes the remote binary.
+func parseReportedHash(raw string) string {
+	// Scan lines so a leading banner/echo over a PTY doesn't hide the report.
+	for _, line := range strings.Split(raw, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) >= 3 && fields[0] == "myhostmcp" {
+			return fields[2]
+		}
+	}
+	return ""
+}
+
+// sha256Hex returns the hex-encoded SHA-256 of b.
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }

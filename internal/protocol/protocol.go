@@ -6,6 +6,22 @@
 // local half speaks this private protocol to the remote half.
 package protocol
 
+// APC framing (recording-friendly mode). When enabled, each Response is wrapped
+// in a terminal Application Program Command string: ESC '_' <payload> ESC '\'.
+// Terminal emulators — including xterm.js, which Teleport's session player uses
+// — parse and silently discard APC strings, so the wrapped protocol is
+// invisible on playback while a human-readable transcript emitted alongside it
+// is shown. The payload is APCTag + <nonce> + <json>, where <nonce> is a
+// per-session secret (hex) that lets the local half reject spoofed APC strings
+// injected by command output. Because encoding/json escapes all control bytes
+// (including ESC as \u001b), a marshaled Response never contains a raw ESC and
+// so can never prematurely terminate the APC envelope.
+const (
+	APCStart = "\x1b_"  // Application Program Command - introducer
+	APCEnd   = "\x1b\\" // String Terminator
+	APCTag   = "MH"     // payload prefix, followed by <nonce><json>
+)
+
 // Request is sent from the local half to the remote.
 //
 //   type = "exec"             : run a command in the persistent shell

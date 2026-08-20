@@ -247,6 +247,8 @@ func remoteCmd(args []string) {
 	fs := flag.NewFlagSet("remote", flag.ExitOnError)
 	showVersion := fs.Bool("version", false, "print build version and exit")
 	configPath := fs.String("config", "", "path to the remote config file (default: /etc/myhostmcp/config.yaml)")
+	apc := fs.Bool("apc", false, "recording-friendly framing: wrap responses in an APC envelope and emit a "+
+		"human-readable transcript so Teleport session recordings play back as a readable shell session")
 	_ = fs.Parse(args)
 
 	if *showVersion {
@@ -254,7 +256,7 @@ func remoteCmd(args []string) {
 		return
 	}
 
-	cfg := remote.Config{ConfigPath: *configPath}
+	cfg := remote.Config{ConfigPath: *configPath, APC: *apc}
 	e, err := remote.New(cfg, os.Stdin, os.Stdout, os.Stderr)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "myhostmcp remote:", err)

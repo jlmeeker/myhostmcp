@@ -12,6 +12,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,6 +45,12 @@ type Config struct {
 	ConfigPath string   // path to the remote config file; "" = /etc/myhostmcp/config.yaml
 	Shell      string   // shell binary, default "bash"
 	ShellArgs  []string // shell args, default ["--noprofile","--norc"]
+
+	// APC enables recording-friendly framing: each Response is wrapped in an
+	// invisible APC envelope (see package protocol) and, for exec results, a
+	// human-readable transcript is emitted alongside it so Teleport session
+	// recordings play back as a readable shell session.
+	APC bool
 }
 
 // Executor is the remote half.
@@ -61,7 +69,8 @@ type Executor struct {
 	stderrRemainder []byte
 	cwd             string
 	pid             int
-	hasTimeout      bool // timeout(1) is available on the host
+	hasTimeout      bool   // timeout(1) is available on the host
+	nonce           string // per-session secret tagging genuine APC frames
 
 	allow [][]string // immutable after New; loaded from the remote config file
 }
@@ -84,8 +93,13 @@ func New(cfg Config, r io.Reader, w, errOut io.Writer) (*Executor, error) {
 	}
 	userGroups := lookupUserGroups()
 	allowCmds := rc.Resolve(userGroups)
+	var nb [16]byte
+	if _, err := rand.Read(nb[:]); err != nil {
+		return nil, fmt.Errorf("generate session nonce: %w", err)
+	}
 	e := &Executor{
 		cfg:        cfg,
+		nonce:      hex.EncodeToString(nb[:]),
 		in:         bufio.NewReader(r),
 		out:        w,
 		logf:       log.New(errOut, "remote: ", log.LstdFlags|log.Lmicroseconds),
@@ -147,7 +161,11 @@ func (e *Executor) Run(ctx context.Context) error {
 			} else {
 				switch req.Type {
 				case "exec":
-					if !e.writeResp(e.exec(req)) {
+					resp := e.exec(req)
+					if e.cfg.APC {
+						e.writeTranscript(req, resp)
+					}
+					if !e.writeResp(resp) {
 						return fmt.Errorf("protocol write failed")
 					}
 				case "allowed_commands":
@@ -420,12 +438,67 @@ func (e *Executor) writeResp(r protocol.Response) bool {
 		e.logf.Printf("marshal response failed: %v", err)
 		return false
 	}
-	b = append(b, '\n')
-	if _, err := e.out.Write(b); err != nil {
+	var out []byte
+	if e.cfg.APC {
+		// Wrap in an APC envelope so terminal emulators (and the Teleport
+		// session player) discard it on playback, while the local half parses
+		// it live. The nonce lets the local half reject spoofed APC strings.
+		out = make([]byte, 0, len(protocol.APCStart)+len(protocol.APCTag)+len(e.nonce)+len(b)+len(protocol.APCEnd))
+		out = append(out, protocol.APCStart...)
+		out = append(out, protocol.APCTag...)
+		out = append(out, e.nonce...)
+		out = append(out, b...)
+		out = append(out, protocol.APCEnd...)
+	} else {
+		out = append(b, '\n')
+	}
+	if _, err := e.out.Write(out); err != nil {
 		e.logf.Printf("protocol write failed: %v", err)
 		return false
 	}
 	return true
+}
+
+// writeTranscript emits a human-readable rendering of an exec result to the
+// protocol channel (the recorded PTY). It is deliberately plain text so a
+// Teleport session replay reads like a normal shell session; the authoritative
+// structured data still travels in the APC-wrapped Response. Line endings are
+// normalized to CRLF because the PTY is in raw mode (no ONLCR translation).
+func (e *Executor) writeTranscript(req protocol.Request, resp protocol.Response) {
+	var b strings.Builder
+	b.WriteString("$ ")
+	b.WriteString(toCRLF(req.Command))
+	b.WriteString("\r\n")
+	writeBlock := func(s string) {
+		if s == "" {
+			return
+		}
+		b.WriteString(toCRLF(s))
+		if !strings.HasSuffix(s, "\n") {
+			b.WriteString("\r\n")
+		}
+	}
+	writeBlock(resp.Stdout)
+	writeBlock(resp.Stderr)
+	switch {
+	case resp.Type == "error":
+		b.WriteString(toCRLF(resp.Error))
+		b.WriteString("\r\n")
+	case resp.TimedOut:
+		fmt.Fprintf(&b, "[timed out] exit %d\r\n", resp.ExitCode)
+	default:
+		fmt.Fprintf(&b, "exit %d\r\n", resp.ExitCode)
+	}
+	if _, err := e.out.Write([]byte(b.String())); err != nil {
+		e.logf.Printf("transcript write failed: %v", err)
+	}
+}
+
+// toCRLF normalizes any line endings in s to CRLF for clean rendering on a
+// raw-mode PTY.
+func toCRLF(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\n", "\r\n")
 }
 
 func (e *Executor) killShell() {

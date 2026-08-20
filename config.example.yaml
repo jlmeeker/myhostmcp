@@ -126,6 +126,27 @@
 #
 # teleportCluster: prod-us-east
 
+# rawProtocol: opt out of recording-friendly Teleport session recordings.
+#
+# By default, tsh (Teleport) sessions are recording-friendly: the remote half
+# emits a human-readable transcript (the command, its stdout/stderr, and its
+# exit code) to the recorded PTY, and carries the structured protocol inside an
+# invisible terminal APC escape sequence that terminal emulators (including
+# Teleport's session player) discard on playback. So a session replay reads
+# like a real shell session, while the agent still receives fully structured
+# output. A per-session nonce prevents command output from spoofing a response.
+#
+# Set rawProtocol: true to disable this and revert to the raw newline-JSON
+# protocol over the PTY (session replays then show protocol JSON instead of the
+# commands and their output). Reasons you might: to avoid sending command
+# output twice for very large outputs, or if your replay tooling does not
+# discard APC escape sequences.
+#
+# No effect on the ssh transport, which is never recorded and always uses the
+# raw protocol. Default: false (recording-friendly enabled).
+#
+# rawProtocol: true
+
 # ----------------------------------------------------------------------------
 # Example: plain SSH environment (no Teleport)
 # ----------------------------------------------------------------------------
