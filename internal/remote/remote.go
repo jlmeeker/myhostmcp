@@ -18,6 +18,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/user"
 	"strconv"
 	"strings"
 	"time"
@@ -81,6 +82,8 @@ func New(cfg Config, r io.Reader, w, errOut io.Writer) (*Executor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load remote config: %w", err)
 	}
+	userGroups := lookupUserGroups()
+	allowCmds := rc.Resolve(userGroups)
 	e := &Executor{
 		cfg:        cfg,
 		in:         bufio.NewReader(r),
@@ -90,9 +93,16 @@ func New(cfg Config, r io.Reader, w, errOut io.Writer) (*Executor, error) {
 		stdoutDone: make(chan struct{}),
 		stderrCh:   make(chan []byte, 1),
 		stderrDone: make(chan struct{}),
-		allow:      rc.AllowCommands,
+		allow:      allowCmds,
 	}
-	e.logf.Printf("allowlist: %d entries (from %s)", len(e.allow), rc.Path)
+	// Log only the configured groups that actually contributed commands.
+	var matchedGroups []string
+	for _, g := range userGroups {
+		if _, ok := rc.GroupAllowCommands[g]; ok {
+			matchedGroups = append(matchedGroups, g)
+		}
+	}
+	e.logf.Printf("allowlist: %d entries (from %s, matched groups: %v)", len(e.allow), rc.Path, matchedGroups)
 	return e, nil
 }
 
@@ -469,4 +479,27 @@ func (e *Executor) cleanup() {
 // shellQuote single-quotes s for safe inclusion in a shell command.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// lookupUserGroups returns the names of all system groups the current process
+// user belongs to. Any lookup error is silently ignored: if groups cannot be
+// determined the user falls back to the base allowlist only, which is safe.
+func lookupUserGroups() []string {
+	u, err := user.Current()
+	if err != nil {
+		return nil
+	}
+	gids, err := u.GroupIds()
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(gids))
+	for _, gid := range gids {
+		g, err := user.LookupGroupId(gid)
+		if err != nil {
+			continue
+		}
+		names = append(names, g.Name)
+	}
+	return names
 }

@@ -1,0 +1,93 @@
+# /etc/myhostmcp/config.yaml — remote-half configuration
+#
+# This file lives on the REMOTE HOST and is the only place the command
+# allowlist is specified. The local agent cannot set or relax it; it can only
+# query it (via remote_allowed_commands). If this file is absent or
+# allowCommands is empty, the safe built-in default is used:
+#   df, ss, top, free, ls
+#
+# Install:
+#   sudo mkdir -p /etc/myhostmcp
+#   sudo cp config.remote.example.yaml /etc/myhostmcp/config.yaml
+#   sudoedit /etc/myhostmcp/config.yaml
+#
+# After editing, just reconnect — no remote restart needed. The local half
+# re-uploads the remote binary on version mismatch, but config changes take
+# effect immediately on the next connection.
+
+# ----------------------------------------------------------------------------
+# Base allowlist — applies to ALL users on this host, regardless of group.
+#
+# Each entry is a command prefix: the first token(s) of every pipeline segment
+# must match one entry. "systemctl restart" allows any `systemctl restart …`
+# but not `systemctl stop …`. A bare "systemctl" allows all subcommands.
+#
+# While an allowlist is active:
+#   • I/O redirection (<, >, >>, <<, >&) is blocked.
+#   • Command substitution ($(...) and backticks) is blocked.
+#   • Every segment of a pipeline / sequence must independently match an entry.
+# ----------------------------------------------------------------------------
+allowCommands:
+  - df
+  - free
+  - ps
+  - ss
+  - ls
+  - top
+  - "systemctl status"
+  - "journalctl -n"
+  - "journalctl --no-pager"
+
+# ----------------------------------------------------------------------------
+# Group-based allowlists (optional) — extra commands for users in a given
+# system group. The effective allowlist for a user is the UNION of the base
+# allowCommands above and all groups the user belongs to that appear here.
+# Groups are additive and never subtractive.
+#
+# Example: a user in "operations" gets everything above PLUS systemctl restart,
+# reload, and full journalctl access. A user in both "operations" and "web"
+# gets all three sets merged together.
+#
+# Users in no configured group get only the base allowCommands above.
+# ----------------------------------------------------------------------------
+groups:
+  # Members of the "operations" group get broader system-management access.
+  operations:
+    allowCommands:
+      - "systemctl restart"
+      - "systemctl reload"
+      - "systemctl start"
+      - "systemctl stop"
+      - "systemctl enable"
+      - "systemctl disable"
+      - journalctl
+      - dmesg
+      - netstat
+      - ss
+      - lsof
+      - iostat
+      - vmstat
+      - sar
+      - strace
+
+  # Members of the "web" group can inspect and reload web services.
+  web:
+    allowCommands:
+      - "nginx -t"
+      - "systemctl reload nginx"
+      - "systemctl restart nginx"
+      - "systemctl status nginx"
+      - "systemctl status php-fpm"
+      - "systemctl reload php-fpm"
+      - curl
+      - wget
+
+  # Members of the "dba" group can run database-related commands.
+  dba:
+    allowCommands:
+      - "systemctl status postgresql"
+      - "systemctl status mysql"
+      - "systemctl status mariadb"
+      - pg_dump
+      - pg_restore
+      - mysqldump

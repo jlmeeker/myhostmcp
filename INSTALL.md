@@ -100,15 +100,56 @@ Every segment of a command (split at `;`, `|`, `&&`, `||`, `&`) must begin
 with one entry's tokens. Command substitution (`$(...)`, backtick) and I/O
 redirection (`<`, `>`, `>>`, `<<`) are rejected while an allowlist is active.
 
+#### Base allowlist
+
+The `allowCommands` list applies to **every** user on the host:
+
 ```yaml
 allowCommands:
   - df
   - free
   - ps
   - ss
-  - "systemctl restart"
-  - "systemctl status"
+  - "systemctl status"   # prefix: allows any `systemctl status …`
+  - "systemctl restart"  # but NOT `systemctl stop …`
 ```
+
+#### Group-based allowlists
+
+Use the `groups` key to grant **additional** commands to users who are members
+of a specific system group. The effective allowlist for a connecting user is
+the **union** of the base `allowCommands` and every configured group the user
+belongs to. Users in no configured group get only the base list.
+
+```yaml
+allowCommands:
+  - df
+  - ls
+
+groups:
+  # SSH users in the "operations" system group get these on top of the base.
+  operations:
+    allowCommands:
+      - systemctl       # all subcommands
+      - journalctl
+      - dmesg
+      - lsof
+
+  # SSH users in the "web" group get these on top of the base.
+  web:
+    allowCommands:
+      - "nginx -t"
+      - "systemctl reload nginx"
+      - curl
+```
+
+Group membership is looked up from the OS at startup (`/etc/group` or nsswitch),
+so it picks up LDAP/NIS groups too. A user in both `operations` and `web` gets
+all three lists merged. `remote_allowed_commands` always returns the **effective**
+merged list for the connecting user's session.
+
+See `config.remote.example.yaml` for a fuller example with `operations`, `web`,
+and `dba` groups.
 
 Enforcement happens **on the remote half**, so the policy cannot be bypassed
 by anything the local agent does; disallowed commands come back as remote
