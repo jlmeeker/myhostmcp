@@ -46,6 +46,12 @@ type Config struct {
 	Shell      string   // shell binary, default "bash"
 	ShellArgs  []string // shell args, default ["--noprofile","--norc"]
 
+	// UserGroups optionally overrides system group lookup for allowlist
+	// resolution. When empty, New uses the current OS user's group memberships.
+	// This is used by serve-http mode to map authenticated token users to
+	// configured allowlist groups.
+	UserGroups []string
+
 	// APC enables recording-friendly framing: each Response is wrapped in an
 	// invisible APC envelope (see package protocol) and, for exec results, a
 	// human-readable transcript is emitted alongside it so Teleport session
@@ -91,7 +97,10 @@ func New(cfg Config, r io.Reader, w, errOut io.Writer) (*Executor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load remote config: %w", err)
 	}
-	userGroups := lookupUserGroups()
+	userGroups := cfg.UserGroups
+	if len(userGroups) == 0 {
+		userGroups = lookupUserGroups()
+	}
 	allowCmds := rc.Resolve(userGroups)
 	var nb [16]byte
 	if _, err := rand.Read(nb[:]); err != nil {

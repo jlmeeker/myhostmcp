@@ -269,7 +269,8 @@ func (s *Server) handleConnect(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 	s.mu.Unlock()
 
-	sess, err := newExecSession(username, name, s.cfg.RemoteConfigPath, s.log)
+	groups := s.auth.GroupsForUser(username)
+	sess, err := newExecSession(username, name, groups, s.cfg.RemoteConfigPath, s.log)
 	if err != nil {
 		return s.errResult("connect failed: "+err.Error(), ConnectOutput{}), ConnectOutput{}, nil
 	}
@@ -561,10 +562,10 @@ func filterOrder(order []string, remove []string) []string {
 	return out
 }
 
-func newExecSession(owner, name, remoteConfigPath string, logger *log.Logger) (*execSession, error) {
+func newExecSession(owner, name string, groups []string, remoteConfigPath string, logger *log.Logger) (*execSession, error) {
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	e, err := remote.New(remote.Config{ConfigPath: remoteConfigPath}, inR, outW, logWriter{log: logger, prefix: fmt.Sprintf("[%s/%s remote] ", owner, name)})
+	e, err := remote.New(remote.Config{ConfigPath: remoteConfigPath, UserGroups: groups}, inR, outW, logWriter{log: logger, prefix: fmt.Sprintf("[%s/%s remote] ", owner, name)})
 	if err != nil {
 		_ = inW.Close()
 		_ = outR.Close()

@@ -13,6 +13,11 @@
 
 users:
   - username: agent-prod
+    # Optional logical groups for allowlist expansion from /etc/myhostmcp/config.yaml.
+    # These map to keys under `groups:` in that file.
+    groups:
+      - operations
+
     # Optional plaintext tokens (simple, less secure at rest):
     tokens:
       - "replace-with-long-random-token-1"
@@ -24,5 +29,7 @@ users:
       - "$2y$12$replace.with.real.bcrypt.hash.for.token.2................"
 
   - username: agent-readonly
+    groups:
+      - web
     tokenHashes:
       - "$2y$12$replace.with.real.bcrypt.hash.for.readonly.token............."

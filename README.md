@@ -16,8 +16,9 @@ binary with three modes:
 - **`myhostmcp serve-http`** — an HTTPS MCP endpoint for non-local agents.
   Clients authenticate with token auth from a root-managed auth file
   (HTTP Basic `username:token` and `Authorization: Bearer <token>`).
-  The auth file supports plaintext `tokens` and preferred bcrypt
-  `tokenHashes`. Tool names are the same (`remote_connect`, `remote_exec`, ...),
+  The auth file supports plaintext `tokens`, preferred bcrypt `tokenHashes`,
+  and optional per-user `groups` that map to remote allowlist groups.
+  Tool names are the same (`remote_connect`, `remote_exec`, ...),
   but sessions run locally on the host (no SSH hop).
 
 ```

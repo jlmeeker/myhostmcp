@@ -192,6 +192,8 @@ Notes:
   - Bearer (`Authorization: Bearer <token>`)
 - `/etc/myhostmcp/http-auth.yaml` supports plaintext `tokens` and bcrypt
   `tokenHashes` (recommended).
+- Optional `users[].groups` in `http-auth.yaml` map token users to allowlist
+  groups defined under `groups:` in `/etc/myhostmcp/config.yaml`.
 - `http-auth.yaml` must not be world-accessible, or startup fails.
 - Tool names are unchanged (`remote_connect`, `remote_exec`, ...), but sessions
   are local to that host (no SSH hop).

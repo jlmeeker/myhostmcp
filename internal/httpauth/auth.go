@@ -31,6 +31,7 @@ type User struct {
 	Username    string   `yaml:"username"`
 	Tokens      []string `yaml:"tokens,omitempty"`
 	TokenHashes []string `yaml:"tokenHashes,omitempty"`
+	Groups      []string `yaml:"groups,omitempty"`
 }
 
 // Load parses the auth config and validates basic file safety constraints.
@@ -93,6 +94,10 @@ func Load(path string) (*Config, error) {
 		if len(u.Tokens) == 0 && len(u.TokenHashes) == 0 {
 			return nil, fmt.Errorf("auth config %q: user %q has neither tokens nor tokenHashes", path, u.Username)
 		}
+		for i := range u.Groups {
+			u.Groups[i] = strings.TrimSpace(u.Groups[i])
+		}
+		u.Groups = nonEmpty(u.Groups)
 		for _, h := range u.TokenHashes {
 			if _, err := bcrypt.Cost([]byte(h)); err != nil {
 				return nil, fmt.Errorf("auth config %q: user %q has invalid bcrypt hash: %w", path, u.Username, err)
@@ -136,6 +141,17 @@ func (c *Config) AuthenticateBearer(token string) (string, error) {
 		}
 	}
 	return "", ErrUnauthorized
+}
+
+// GroupsForUser returns the configured logical groups for username.
+func (c *Config) GroupsForUser(username string) []string {
+	u, ok := c.byUsername[username]
+	if !ok || len(u.Groups) == 0 {
+		return nil
+	}
+	out := make([]string, len(u.Groups))
+	copy(out, u.Groups)
+	return out
 }
 
 func matchUserToken(u User, token string) bool {

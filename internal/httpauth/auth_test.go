@@ -17,6 +17,9 @@ func TestLoadAndAuthenticate(t *testing.T) {
 	}
 	content := "users:\n" +
 		"  - username: alice\n" +
+		"    groups:\n" +
+		"      - operations\n" +
+		"      - web\n" +
 		"    tokens:\n" +
 		"      - plain-token\n" +
 		"  - username: bob\n" +
@@ -46,6 +49,10 @@ func TestLoadAndAuthenticate(t *testing.T) {
 	u, err = cfg.AuthenticateBearer("s3cr3t-hash")
 	if err != nil || u != "bob" {
 		t.Fatalf("AuthenticateBearer(hash) = %q, %v; want bob, nil", u, err)
+	}
+	groups := cfg.GroupsForUser("alice")
+	if len(groups) != 2 || groups[0] != "operations" || groups[1] != "web" {
+		t.Fatalf("GroupsForUser(alice) = %v; want [operations web]", groups)
 	}
 }
 
