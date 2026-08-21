@@ -1,0 +1,28 @@
+# /etc/myhostmcp/http-auth.yaml — HTTP mode credentials
+#
+# Supported HTTP Authorization styles:
+#   - Basic  (Authorization: Basic base64(username:token))
+#   - Bearer (Authorization: Bearer <token>)
+#
+# IMPORTANT:
+#   - Recommended owner/group: root:root
+#   - Recommended mode: 0600 (or 0640 if needed)
+#   - myhostmcp serve-http refuses to start if this file grants any permission
+#     to "other" (world).
+#   - Prefer tokenHashes (bcrypt) over plaintext tokens.
+
+users:
+  - username: agent-prod
+    # Optional plaintext tokens (simple, less secure at rest):
+    tokens:
+      - "replace-with-long-random-token-1"
+
+    # Preferred: bcrypt hashes generated from tokens.
+    # Example:
+    #   htpasswd -bnBC 12 "" "replace-with-long-random-token-2" | tr -d ':\n'
+    tokenHashes:
+      - "$2y$12$replace.with.real.bcrypt.hash.for.token.2................"
+
+  - username: agent-readonly
+    tokenHashes:
+      - "$2y$12$replace.with.real.bcrypt.hash.for.readonly.token............."

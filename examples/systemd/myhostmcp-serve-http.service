@@ -1,0 +1,28 @@
+[Unit]
+Description=myhostmcp HTTPS MCP server (serve-http)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust to where your binary is installed.
+ExecStart=/usr/local/bin/myhostmcp serve-http --config /etc/myhostmcp/http-server.yaml
+Restart=on-failure
+RestartSec=3
+
+# Recommended: run as a dedicated service account (adjust as needed).
+User=myhostmcp
+Group=myhostmcp
+
+# Basic hardening.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+# Optional: let systemd create a writable runtime dir.
+RuntimeDirectory=myhostmcp
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

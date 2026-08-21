@@ -8,7 +8,8 @@
 //	myhostmcp remote   run the remote executor on stdin/stdout (uploaded to hosts)
 //	myhostmcp demo     drive `myhostmcp remote` over pipes to prove the
 //	                   executor end-to-end without SSH
-//	myhostmcp version  print the build version
+//	myhostmcp serve-http run an HTTPS MCP server with token auth
+//	myhostmcp version    print the build version
 package main
 
 import (
@@ -28,6 +29,8 @@ func main() {
 		remoteCmd(os.Args[2:])
 	case "demo":
 		demoCmd(os.Args[2:])
+	case "serve-http":
+		serveHTTPCmd(os.Args[2:])
 	case "version", "--version", "-v":
 		printVersion()
 	default:
@@ -37,5 +40,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: myhostmcp <local|remote|demo|version> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: myhostmcp <local|remote|demo|serve-http|version> [flags]")
 }

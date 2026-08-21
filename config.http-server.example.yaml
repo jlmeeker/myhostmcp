@@ -1,0 +1,36 @@
+# /etc/myhostmcp/http-server.yaml — HTTPS MCP server mode configuration
+#
+# This mode exposes myhostmcp as a persistent MCP endpoint over HTTPS, using
+# token authentication from authConfigPath (HTTP Basic username+token and
+# Authorization: Bearer <token> are both supported).
+#
+# Install:
+#   sudo mkdir -p /etc/myhostmcp
+#   sudo cp config.http-server.example.yaml /etc/myhostmcp/http-server.yaml
+#   sudoedit /etc/myhostmcp/http-server.yaml
+#
+# Start:
+#   myhostmcp serve-http --config /etc/myhostmcp/http-server.yaml
+
+# Bind address for the HTTPS listener.
+listen: ":8443"
+
+# TLS certificate and key are required in this mode.
+tlsCertFile: "/etc/myhostmcp/tls/server.crt"
+tlsKeyFile: "/etc/myhostmcp/tls/server.key"
+
+# Allowlist policy used by the execution engine.
+# Same format and semantics as `myhostmcp remote --config`.
+remoteConfigPath: "/etc/myhostmcp/config.yaml"
+
+# Username+token credential file. Should not be world-accessible.
+authConfigPath: "/etc/myhostmcp/http-auth.yaml"
+
+# Optional log path. If omitted, logs go to stderr.
+# logFile: "/var/log/myhostmcp-http.log"
+
+# Optional defaults for command execution and HTTP server timeouts.
+execTimeout: "60s"
+readTimeout: "30s"
+writeTimeout: "0s"
+idleTimeout: "2m"

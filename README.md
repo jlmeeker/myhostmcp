@@ -4,7 +4,7 @@
 
 `myhostmcp` lets an AI agent run commands on a remote host *in a persistent
 session*, over SSH, using your normal local SSH credentials. It is a single
-binary with two modes:
+binary with three modes:
 
 - **`myhostmcp local`** — a stdio MCP server that your agent spawns. It exposes
   a few tools (`remote_connect`, `remote_exec`, `remote_status`,
@@ -13,6 +13,12 @@ binary with two modes:
 - **`myhostmcp remote`** — the executor that runs *on the remote host*. It owns
   one persistent shell and runs commands in it, returning captured stdout,
   stderr, exit code and current working directory.
+- **`myhostmcp serve-http`** — an HTTPS MCP endpoint for non-local agents.
+  Clients authenticate with token auth from a root-managed auth file
+  (HTTP Basic `username:token` and `Authorization: Bearer <token>`).
+  The auth file supports plaintext `tokens` and preferred bcrypt
+  `tokenHashes`. Tool names are the same (`remote_connect`, `remote_exec`, ...),
+  but sessions run locally on the host (no SSH hop).
 
 ```
  ┌───────────┐  stdio (MCP)   ┌──────────────┐  ssh (os/exec)  ┌────────────────────────┐
@@ -47,7 +53,7 @@ There are two independent config files:
 ## Project layout
 
 ```
-cmd/myhostmcp/                   dispatch: local | remote | demo | version
+cmd/myhostmcp/                   dispatch: local | remote | demo | serve-http | version
   main.go                        (cmd_local.go excluded from remote_only builds)
 internal/version/                shared build version
 internal/protocol/               JSON messages over the SSH channel (private, not MCP)
@@ -57,6 +63,9 @@ internal/remoteconfig/           remote-half YAML config (/etc/myhostmcp/config.
 internal/remote/                 the executor (persistent bash, sentinel, capture, timeout, builtins)
 internal/transport/              ssh via os/exec: dial, embedded-binary upload, framing IO
 internal/local/                  stdio MCP server + tool handlers + session mgmt
+internal/httpconfig/             HTTPS server-mode config (/etc/myhostmcp/http-server.yaml)
+internal/httpauth/               HTTP token auth config loader (/etc/myhostmcp/http-auth.yaml)
+internal/httpserver/             HTTPS MCP server mode (streamable HTTP + token auth)
 internal/embed/                  go:embed of cross-compiled remote binaries (build.sh-generated)
 build.sh                         cross-compile remote targets → embed → build local
 examples/stdio_client/           example MCP client that spawns `myhostmcp local` over stdio
@@ -96,6 +105,7 @@ examples/pi-extension/           pi extension (pi has no built-in MCP; this brid
 |-------|------|------|
 | 0 | Executor: persistent shell, sentinel framing, separated stdout/stderr, cwd tracking, timeouts, allowlist | ✅ |
 | 1 | SSH transport + `myhostmcp local` stdio MCP server with the 5 tools + embedded-binary upload | ✅ |
+| 1.5 | Optional HTTPS MCP endpoint (`serve-http`) with token auth (Basic + Bearer, bcrypt hashes supported) | ✅ |
 | 2 | Robustness: drop/reconnect, large-output streaming, pty mode, takeover option | planned |
 | 3 | Convenience tools (`read_file`/`write_file`), polish | planned |
 

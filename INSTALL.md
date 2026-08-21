@@ -2,9 +2,11 @@
 
 `myhostmcp` lets an AI agent run commands on a remote host in a persistent
 session, over SSH, using **your normal local SSH credentials** (no credentials
-or hosts are ever embedded in the binary). It is a single Go binary with two
-modes: `myhostmcp local` (a stdio MCP server your agent spawns) and
-`myhostmcp remote` (the executor it uploads to and runs on the remote host).
+or hosts are ever embedded in the binary). It is a single Go binary with three
+modes: `myhostmcp local` (a stdio MCP server your agent spawns),
+`myhostmcp remote` (the executor it uploads to and runs on the remote host),
+and `myhostmcp serve-http` (an HTTPS MCP endpoint with token auth for
+non-local agents).
 
 This guide covers building it, optional configuration (local **and** remote),
 and wiring it into **Claude Code**, **OpenCode**, and **pi** (from pi.dev).
@@ -165,6 +167,54 @@ by anything the local agent does; disallowed commands come back as remote
 errors. The remote must be version-matched to the local half (the local half
 re-uploads on a version mismatch), so after changing `/etc/myhostmcp/config.yaml`
 just reconnect — no restart needed on the remote.
+
+### Optional: HTTPS MCP endpoint (`serve-http`) for non-local agents
+
+If you want a persistent MCP endpoint that remote/cloud agents can call directly,
+configure and run `myhostmcp serve-http` on the host.
+
+```sh
+sudo mkdir -p /etc/myhostmcp
+sudo cp config.http-server.example.yaml /etc/myhostmcp/http-server.yaml
+sudo cp config.http-auth.example.yaml /etc/myhostmcp/http-auth.yaml
+sudo chmod 600 /etc/myhostmcp/http-auth.yaml
+sudoedit /etc/myhostmcp/http-server.yaml
+sudoedit /etc/myhostmcp/http-auth.yaml
+
+# then run (or via systemd)
+myhostmcp serve-http --config /etc/myhostmcp/http-server.yaml
+```
+
+Notes:
+- TLS is required (`tlsCertFile`, `tlsKeyFile`).
+- Auth supports both:
+  - HTTP Basic (`Authorization: Basic base64(username:token)`)
+  - Bearer (`Authorization: Bearer <token>`)
+- `/etc/myhostmcp/http-auth.yaml` supports plaintext `tokens` and bcrypt
+  `tokenHashes` (recommended).
+- `http-auth.yaml` must not be world-accessible, or startup fails.
+- Tool names are unchanged (`remote_connect`, `remote_exec`, ...), but sessions
+  are local to that host (no SSH hop).
+
+#### Optional: run `serve-http` as a systemd service
+
+An example unit is provided at:
+
+- `examples/systemd/myhostmcp-serve-http.service`
+
+Install it (adjust binary path and service user/group):
+
+```sh
+sudo cp examples/systemd/myhostmcp-serve-http.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now myhostmcp-serve-http.service
+sudo systemctl status myhostmcp-serve-http.service
+```
+
+If you run as non-root, ensure that user can read:
+- `/etc/myhostmcp/http-server.yaml`
+- `/etc/myhostmcp/http-auth.yaml`
+- the TLS cert/key files configured in `http-server.yaml`
 
 ---
 
