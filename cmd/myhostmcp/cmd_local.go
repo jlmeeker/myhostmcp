@@ -20,12 +20,16 @@ import (
 func localCmd(args []string) {
 	fs := flag.NewFlagSet("local", flag.ExitOnError)
 	configPath := fs.String("config", "", "path to config.yaml (default: ~/.myhostmcp/config.yaml)")
+	noUpload := fs.Bool("no-upload", false, "never upload the remote binary; require it to be preinstalled on the host")
 	_ = fs.Parse(args)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "myhostmcp local: config error:", err)
 		os.Exit(1)
+	}
+	if *noUpload {
+		cfg.NoUpload = true
 	}
 
 	mgr, err := local.NewManager(cfg)

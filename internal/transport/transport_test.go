@@ -253,6 +253,57 @@ func TestBringUpSkipsUploadWhenHashMatches(t *testing.T) {
 	}
 }
 
+func TestBringUpNoUpload(t *testing.T) {
+	origBinary := binaryForUnameFn
+	t.Cleanup(func() { binaryForUnameFn = origBinary })
+	binaryForUnameFn = func(_, _ string) ([]byte, error) {
+		t.Fatalf("embedded binary must not be consulted when noUpload is set")
+		return nil, nil
+	}
+	origSCP := scpRunner
+	t.Cleanup(func() { scpRunner = origSCP })
+	scpRunner = func(context.Context, string, []string) error {
+		t.Fatalf("scp must not run when noUpload is set")
+		return nil
+	}
+	opts := DialOptions{RemoteInstallDir: "~/.myhostmcp", NoUpload: true}
+
+	// Installed binary with a different hash: used as-is, no upload.
+	s, fsh, done := newFakeSession(t, func(cmd string) (string, int) {
+		switch {
+		case cmd == "uname -sm":
+			return "Darwin arm64\n", 0
+		case strings.Contains(cmd, "remote --version"):
+			return "myhostmcp " + version.Version + " " + sha256Hex([]byte("other-bytes")) + "\n", 0
+		default:
+			return "", 0
+		}
+	})
+	if err := s.bringUp(context.Background(), opts, "~/.myhostmcp/myhostmcp", "ssh"); err != nil {
+		t.Fatalf("bringUp with installed binary: %v", err)
+	}
+	<-done
+	if fsh.sawUpload {
+		t.Fatalf("unexpected upload")
+	}
+
+	// Missing binary: fail instead of uploading.
+	s, _, _ = newFakeSession(t, func(cmd string) (string, int) {
+		switch {
+		case cmd == "uname -sm":
+			return "Darwin arm64\n", 0
+		case strings.Contains(cmd, "remote --version"):
+			return "__MISSING__\n", 0
+		default:
+			return "", 0
+		}
+	})
+	err := s.bringUp(context.Background(), opts, "~/.myhostmcp/myhostmcp", "ssh")
+	if err == nil || !strings.Contains(err.Error(), "uploads are disabled") {
+		t.Fatalf("want uploads-disabled error for missing binary, got %v", err)
+	}
+}
+
 func TestBringUpUploadsViaSCPWhenHashDiffers(t *testing.T) {
 	origBinary := binaryForUnameFn
 	t.Cleanup(func() { binaryForUnameFn = origBinary })

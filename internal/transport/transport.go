@@ -111,6 +111,7 @@ type DialOptions struct {
 	ConnectTimeout        time.Duration   // applied to connection steps (not tsh login)
 	StrictHostKeyChecking string          // ssh StrictHostKeyChecking value; default "accept-new"
 	TransportBinary       TransportBinary // which binary to use; default TransportAuto
+	NoUpload              bool            // never upload the remote binary; require it to be preinstalled
 
 	// Teleport-specific options (used only when binary == "tsh").
 
@@ -982,19 +983,31 @@ func (s *Session) bringUp(ctx context.Context, opts DialOptions, remotePath, bin
 	//    the SHA-256 of its own file via `remote --version`. An old remote that
 	//    predates hash reporting yields an empty hash, which counts as a mismatch
 	//    and triggers a refresh.
-	bin, err := binaryForUnameFn(sysname, machine)
-	if err != nil {
-		return fmt.Errorf("no prebuilt remote binary for %s %s: %w", sysname, machine, err)
-	}
-	wantHash := sha256Hex(bin)
 	check := fmt.Sprintf("if [ -x %s ]; then %s remote --version; else echo __MISSING__; fi", remotePath, remotePath)
-	out, _, err = s.sh(check)
-	if err != nil {
-		return fmt.Errorf("version check: %w", err)
-	}
-	if parseReportedHash(out) != wantHash {
-		if err := s.installBinary(ctx, opts, binary, remotePath, sysname, bin); err != nil {
-			return fmt.Errorf("upload: %w", err)
+	if opts.NoUpload {
+		// Use whatever is installed (e.g. preseeded by provisioning). A
+		// version mismatch is still caught after the remote announces ready.
+		out, _, err = s.sh(check)
+		if err != nil {
+			return fmt.Errorf("version check: %w", err)
+		}
+		if strings.Contains(out, "__MISSING__") {
+			return fmt.Errorf("remote binary %s is not installed and uploads are disabled (noUpload)", remotePath)
+		}
+	} else {
+		bin, err := binaryForUnameFn(sysname, machine)
+		if err != nil {
+			return fmt.Errorf("no prebuilt remote binary for %s %s: %w", sysname, machine, err)
+		}
+		wantHash := sha256Hex(bin)
+		out, _, err = s.sh(check)
+		if err != nil {
+			return fmt.Errorf("version check: %w", err)
+		}
+		if parseReportedHash(out) != wantHash {
+			if err := s.installBinary(ctx, opts, binary, remotePath, sysname, bin); err != nil {
+				return fmt.Errorf("upload: %w", err)
+			}
 		}
 	}
 

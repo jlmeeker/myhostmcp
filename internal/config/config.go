@@ -48,6 +48,11 @@ type Config struct {
 	ExecTimeout           Duration `yaml:"execTimeout"`
 	LogFile               string   `yaml:"logFile"`
 
+	// NoUpload stops the local half from uploading the remote binary. The
+	// binary must already be installed in remoteInstallDir (e.g. preseeded by
+	// provisioning); a connect fails if it is missing. Also set by --no-upload.
+	NoUpload bool `yaml:"noUpload"`
+
 	// Transport selects which binary to use for SSH connections.
 	// Valid values: "" or "auto" (default; try tsh then ssh), "ssh", "tsh".
 	Transport string `yaml:"transport"`

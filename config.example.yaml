@@ -51,6 +51,12 @@
 #
 # remoteInstallDir: ~/.myhostmcp
 
+# noUpload: never upload the remote binary; it must already be installed in
+# remoteInstallDir (e.g. preseeded by provisioning) or connect fails. Also set
+# by `myhostmcp local --no-upload`. Default: false.
+#
+# noUpload: true
+
 # ----------------------------------------------------------------------------
 # Security
 # ----------------------------------------------------------------------------

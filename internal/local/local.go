@@ -270,6 +270,7 @@ func (m *Manager) handleConnect(ctx context.Context, _ *mcp.CallToolRequest, in 
 		RemoteInstallDir:      m.cfg.RemoteInstallDir,
 		ConnectTimeout:        time.Duration(m.cfg.ConnectTimeout),
 		StrictHostKeyChecking: m.cfg.StrictHostKeyChecking,
+		NoUpload:              m.cfg.NoUpload,
 		TransportBinary:       tBinary,
 		TeleportProxy:         tProxy,
 		TeleportCluster:       tCluster,
